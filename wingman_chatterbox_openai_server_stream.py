@@ -7,6 +7,7 @@ import pysbd
 import torch
 from flask import Flask, request, send_file, jsonify, render_template, render_template_string, Response
 from chatterbox.tts import ChatterboxTTS
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 import torchaudio
 
 # Set up Flask app
@@ -23,7 +24,7 @@ parser.add_argument("--device", type=str, default="cpu", help="Device to run ser
 parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, default=False, help="Whether to unload model to cpu when not generating.")
 parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=False, help="Enable audio streaming sentence by sentence.")
 parser.add_argument("--model_path", type=str, default=None, help="Path to a local directory containing model checkpoints.")
-
+parser.add_argument("--language_id", type=str, default="en", help="Two letter language code: Arabic (ar), Danish (da), German (de), Greek (el), English (en), Spanish (es), Finnish (fi), French (fr), Hebrew (he), Hindi (hi), Italian (it), Japanese (ja), Korean (ko), Malay (ms), Dutch (nl), Norwegian (no), Polish (pl), Portuguese (pt), Russian (ru), Swedish (sv), Swahili (sw), Turkish (tr), Chinese (zh)")
 # Chatterbox generation arguments with reasonable defaults
 parser.add_argument("--exaggeration", type=float, default=0.5, help="Exaggeration level (0.5 is neutral).")
 parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature.")
@@ -43,15 +44,25 @@ if "cuda" in DEVICE:
 if "mps" in DEVICE:
     if not torch.backends.mps.is_available():
         DEVICE = "cpu"
+        
+LANGUAGE = args.language_id if args.language_id else "en" # Probably need to check if language in supported languages
 
 def load_chatterbox_tts_model(device):
     try:
-        if args.model_path:
-            print(f"Attempting to load model from local path: {args.model_path}")
-            tts_model = ChatterboxTTS.from_local(ckpt_dir=args.model_path, device=device)
+        if LANGUAGE == "en":
+            if args.model_path:
+                print(f"Attempting to load model from local path: {args.model_path}")
+                tts_model = ChatterboxTTS.from_local(ckpt_dir=args.model_path, device=device)
+            else:
+                print("Attempting to load model from pretrained Hugging Face hub.")
+                tts_model = ChatterboxTTS.from_pretrained(device=device)
         else:
-            print("Attempting to load model from pretrained Hugging Face hub.")
-            tts_model = ChatterboxTTS.from_pretrained(device=device)
+            if args.model_path:
+                print(f"Attempting to load model from local path: {args.model_path}")
+                tts_model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_path, device=device)
+            else:
+                print("Attempting to load model from pretrained Hugging Face hub.")
+                tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     except Exception as e:
         print(f"Could not load Chatterbox model. Error: {e}. If loading from a model path, double check the path.")
     print(f"Model loaded successfully on {device}.")
@@ -156,7 +167,17 @@ def openai_tts():
     if audio_prompt_path != current_audio_prompt_path or args.low_vram:
         get_voice_conds_for_audio_prompt(audio_prompt_path)
         current_audio_prompt_path = audio_prompt_path
-
+    kwargs = dict(
+        exaggeration=args.exaggeration,
+        temperature=args.temperature,
+        cfg_weight=cfg_weight,
+        min_p=args.min_p,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+    )
+    # Add language_id only if not English
+    if LANGUAGE != "en":
+        kwargs["language_id"] = LANGUAGE
     # Streaming
     if stream:
         fmt = payload.get("response_format", "pcm").lower()
@@ -180,13 +201,7 @@ def openai_tts():
                     
                     wav_tensor = chatterbox_model.generate(
                         sentence,
-                        #audio_prompt_path=audio_prompt_path, # Not needed because we always get our conditionals first, either cached or fresh
-                        exaggeration=args.exaggeration,
-                        temperature=args.temperature,
-                        cfg_weight=cfg_weight,
-                        min_p=args.min_p,
-                        top_p=args.top_p,
-                        repetition_penalty=args.repetition_penalty,
+                        **kwargs
                     )
                     waveform_cpu = wav_tensor.squeeze(0).cpu()
 
@@ -212,19 +227,15 @@ def openai_tts():
 
         sentences = split_sentences(text)
         audio_chunks = []
+
         for sentence in sentences:
             # Always use same manual seed for consistency in generation
-            set_seed(12345)
-            
+            set_seed(12345) 
+
+            # Call generate with unpacked kwargs
             wav_tensor = chatterbox_model.generate(
                 sentence,
-                #audio_prompt_path=audio_prompt_path, # Not needed because we always get our conditionals first, either cached or fresh
-                exaggeration=args.exaggeration,
-                temperature=args.temperature,
-                cfg_weight=cfg_weight,
-                min_p=args.min_p,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
+                **kwargs
             )
             audio_chunks.append(wav_tensor)
         
