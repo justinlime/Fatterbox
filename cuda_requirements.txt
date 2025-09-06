@@ -11,3 +11,4 @@ resemble-perth==1.0.1
 conformer==0.3.2
 safetensors
 pysbd
+pykakasi==2.3.0
