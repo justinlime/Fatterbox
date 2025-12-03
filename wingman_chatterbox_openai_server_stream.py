@@ -48,24 +48,7 @@ if "mps" in DEVICE:
 LANGUAGE = args.language_id if args.language_id else "en" # Probably need to check if language in supported languages
 
 def load_chatterbox_tts_model(device):
-    try:
-        if LANGUAGE == "en":
-            if args.model_path:
-                print(f"Attempting to load model from local path: {args.model_path}")
-                tts_model = ChatterboxTTS.from_local(ckpt_dir=args.model_path, device=device)
-            else:
-                print("Attempting to load model from pretrained Hugging Face hub.")
-                tts_model = ChatterboxTTS.from_pretrained(device=device)
-        else:
-            if args.model_path:
-                print(f"Attempting to load model from local path: {args.model_path}")
-                tts_model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_path, device=device)
-            else:
-                print("Attempting to load model from pretrained Hugging Face hub.")
-                tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-    except Exception as e:
-        print(f"Could not load Chatterbox model. Error: {e}. If loading from a model path, double check the path.")
-    print(f"Model loaded successfully on {device}.")
+    tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     return tts_model
 
 
@@ -201,6 +184,7 @@ def openai_tts():
                     
                     wav_tensor = chatterbox_model.generate(
                         sentence,
+                        language_id="en",
                         **kwargs
                     )
                     waveform_cpu = wav_tensor.squeeze(0).cpu()
@@ -235,6 +219,7 @@ def openai_tts():
             # Call generate with unpacked kwargs
             wav_tensor = chatterbox_model.generate(
                 sentence,
+                language_id="en",
                 **kwargs
             )
             audio_chunks.append(wav_tensor)
