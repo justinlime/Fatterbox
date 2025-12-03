@@ -539,7 +539,7 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
             audio_bytes = waveform_int16.numpy().tobytes()
             
             # Send audio in chunks (Wyoming typically uses chunks)
-            chunk_size = 8192
+            chunk_size = 1024
             for i in range(0, len(audio_bytes), chunk_size):
                 chunk = audio_bytes[i:i + chunk_size]
                 await self.write_event(
