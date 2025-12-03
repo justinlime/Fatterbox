@@ -49,6 +49,9 @@ parser.add_argument("--min-p", type=float, default=float(os.getenv("MIN_P", "0.0
 parser.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P", "1.0")), help="top_p for nucleus sampling (1.0 disables it).")
 parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("REPETITION_PENALTY", "1.2")), help="Repetition penalty.")
 
+# T3 optimization argument
+parser.add_argument("--t3-dtype", type=str, default=os.getenv("T3_DTYPE", "bfloat16"), choices=["float32", "float16", "bfloat16"], help="Data type for T3 model (bfloat16 recommended for most modern GPUs).")
+
 args = parser.parse_args()
 segmenter = pysbd.Segmenter(language="en", clean=True)
 current_audio_prompt_path = None
@@ -78,13 +81,59 @@ def load_chatterbox_tts_model(device):
     tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     return tts_model
 
+def t3_to(model: ChatterboxTTS, dtype):
+    """Convert T3 model to specified dtype for optimization"""
+    model.t3.to(dtype=dtype)
+    model.conds.t3.to(dtype=dtype)
+    torch.cuda.empty_cache()
+    return model
 
 # Load the Chatterbox model
 print(f"Loading Chatterbox TTS...")
 chatterbox_model = load_chatterbox_tts_model(DEVICE)
+
+# Apply T3 dtype optimization if on CUDA
+if "cuda" in DEVICE and args.t3_dtype != "float32":
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32
+    }
+    target_dtype = dtype_map[args.t3_dtype]
+    print(f"Optimizing T3 model with dtype: {args.t3_dtype}")
+    t3_to(chatterbox_model, target_dtype)
+
 CURRENT_DEVICE = DEVICE
 
 generation_count = 0
+
+# Hardcoded T3 optimization params for best performance
+T3_PARAMS = {
+    "initial_forward_pass_backend": "eager",
+    "generate_token_backend": "cudagraphs-manual",
+    "stride_length": 4,
+    "skip_when_1": True,
+}
+
+print(f"T3 optimization params: {T3_PARAMS}")
+
+# Warmup generation if using CUDA
+if "cuda" in DEVICE:
+    print("Running warmup generation...")
+    try:
+        # First warmup to initialize CUDA graphs
+        _ = chatterbox_model.generate(
+            "Warmup generation for CUDA graph initialization.",
+            t3_params=T3_PARAMS
+        )
+        # Second generation at full speed
+        _ = chatterbox_model.generate(
+            "Second warmup for full speed.",
+            t3_params=T3_PARAMS
+        )
+        print("Warmup complete!")
+    except Exception as e:
+        print(f"Warmup failed (non-critical): {e}")
 
 def set_seed(seed: int):
     """Set random seeds for reproducibility."""
@@ -104,6 +153,15 @@ def handle_vram_change(desired_device: str):
                     del chatterbox_model
                 gc.collect()
                 chatterbox_model = load_chatterbox_tts_model(desired_device)
+                
+                # Re-apply T3 optimization after loading
+                if args.t3_dtype != "float32":
+                    dtype_map = {
+                        "float16": torch.float16,
+                        "bfloat16": torch.bfloat16,
+                    }
+                    t3_to(chatterbox_model, dtype_map[args.t3_dtype])
+                
                 CURRENT_DEVICE = desired_device
                 print(f"Switched ChatterboxTTS model to {desired_device}.")
 
@@ -193,6 +251,7 @@ def openai_tts():
         min_p=args.min_p,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
+        t3_params=T3_PARAMS,
     )
     # Add language_id only if not English
     if LANGUAGE != "en":
@@ -385,7 +444,12 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
             return True
         
         # Legacy non-streaming protocol (for backward compatibility)
+        # Only handle this if we're not in a streaming session
         if Synthesize.is_type(event.type):
+            if self.is_streaming:
+                logging.warning("Ignoring legacy Synthesize event during streaming session")
+                return True
+                
             synthesize = Synthesize.from_event(event)
             
             # Extract voice name from SynthesizeVoice object
@@ -396,9 +460,9 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
             await self._generate_and_stream_audio(synthesize.text, voice_name)
             
             return True
-        else:
-            logging.warning(f"Unexpected event type: {event.type}")
-            return True
+        
+        logging.warning(f"Unexpected event type: {event.type}")
+        return True
     
     async def _generate_and_stream_audio(self, text: str, voice_name: str):
         """Generate audio and stream it back via Wyoming protocol"""
@@ -431,6 +495,7 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
             min_p=args.min_p,
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
+            t3_params=T3_PARAMS,
         )
         
         if LANGUAGE != "en":
