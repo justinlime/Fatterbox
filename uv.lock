@@ -282,6 +282,7 @@ dependencies = [
     { name = "torchcodec" },
     { name = "transformers" },
     { name = "tts-webui-chatterbox-tts" },
+    { name = "wyoming" },
 ]
 
 [package.metadata]
@@ -302,6 +303,7 @@ requires-dist = [
     { name = "torchcodec", specifier = ">=0.8.1" },
     { name = "transformers", specifier = "==4.46.3" },
     { name = "tts-webui-chatterbox-tts", git = "https://github.com/rsxdalv/chatterbox.git?rev=faster" },
+    { name = "wyoming", specifier = ">=1.8.0" },
 ]
 
 [[package]]
@@ -2132,6 +2134,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/01/3a/07cd60a9d26fe73efead61c7830af975dfdba8537632d410462672e4432b/wrapt-2.0.1-cp314-cp314t-win_amd64.whl", hash = "sha256:61c4956171c7434634401db448371277d07032a81cc21c599c22953374781395", size = 64038, upload-time = "2025-11-07T00:45:00.948Z" },
     { url = "https://files.pythonhosted.org/packages/41/99/8a06b8e17dddbf321325ae4eb12465804120f699cd1b8a355718300c62da/wrapt-2.0.1-cp314-cp314t-win_arm64.whl", hash = "sha256:35cdbd478607036fee40273be8ed54a451f5f23121bd9d4be515158f9498f7ad", size = 60634, upload-time = "2025-11-07T00:45:02.087Z" },
     { url = "https://files.pythonhosted.org/packages/15/d1/b51471c11592ff9c012bd3e2f7334a6ff2f42a7aed2caffcf0bdddc9cb89/wrapt-2.0.1-py3-none-any.whl", hash = "sha256:4d2ce1bf1a48c5277d7969259232b57645aae5686dba1eaeade39442277afbca", size = 44046, upload-time = "2025-11-07T00:45:32.116Z" },
+]
+
+[[package]]
+name = "wyoming"
+version = "1.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/ab/8984e755731fac96405b3ecc2236887855120afb9760f829291bd618c26d/wyoming-1.8.0.tar.gz", hash = "sha256:90c16c9fb7e90cbce277032806b7816e6c631812393206a73298f4ad4ffcdb76", size = 37388, upload-time = "2025-10-10T20:49:43.151Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/b3/8fbcbd8b6587cb33a7deafc5f20a1ec96ee40e8f7a9c2eccc1982a4e0f06/wyoming-1.8.0-py3-none-any.whl", hash = "sha256:1bbd9fb2af1fcc7dc8d397821438ff89173d2aed33f1092c62aae0b3ce6d168d", size = 39282, upload-time = "2025-10-10T20:49:41.911Z" },
 ]
 
 [[package]]

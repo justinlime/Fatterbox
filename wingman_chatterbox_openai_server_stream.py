@@ -11,6 +11,16 @@ from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 import torchaudio
 from threading import Lock
+import asyncio
+import logging
+from functools import partial
+
+# Wyoming protocol imports
+from wyoming.info import Info, TtsProgram, TtsVoice, Attribution
+from wyoming.server import AsyncServer, AsyncEventHandler
+from wyoming.tts import Synthesize, SynthesizeStart, SynthesizeChunk, SynthesizeStop, SynthesizeStopped
+from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.event import Event
 
 # Set up Flask app
 app = Flask(__name__)
@@ -18,11 +28,12 @@ app = Flask(__name__)
 # Global lock for model inference to prevent concurrent CUDA graph issues
 inference_lock = Lock()
 
-parser = argparse.ArgumentParser(description="OpenAI-compatible TTS server for Chatterbox.")
+parser = argparse.ArgumentParser(description="OpenAI-compatible TTS server for Chatterbox with Wyoming protocol support.")
 
 # Server arguments
 parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host for the server.")
-parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5002")), help="Port for the server.")
+parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5002")), help="Port for the Flask server.")
+parser.add_argument("--wyoming-port", type=int, default=int(os.getenv("WYOMING_PORT", "10200")), help="Port for the Wyoming protocol server.")
 parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "").lower() == "true", help="Run the server in debug mode.")
 parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cpu"), help="Device to run server on. Options: cpu, cuda, cuda:0, cuda:1, mps")
 parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, default=os.getenv("LOW_VRAM", "").lower() == "true", help="Whether to unload model to cpu when not generating.")
@@ -307,8 +318,244 @@ def openai_list_models():
         ]
     })
 
+
+# ============================================================================
+# Wyoming Protocol Implementation
+# ============================================================================
+
+class ChatterboxWyomingEventHandler(AsyncEventHandler):
+    """Handles Wyoming protocol events for TTS"""
+    
+    def __init__(self, wyoming_info: Info, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wyoming_info = wyoming_info
+        self.sample_rate = 22050  # Chatterbox default sample rate
+        self.sample_width = 2  # 16-bit audio
+        self.channels = 1  # Mono
+        
+        # Streaming state
+        self.streaming_text_buffer = []
+        self.streaming_voice = None
+        self.is_streaming = False
+        
+    async def handle_event(self, event: Event) -> bool:
+        """Handle incoming Wyoming protocol events"""
+        # Handle describe events - Home Assistant queries server capabilities
+        if event.type == "describe":
+            logging.info("Received describe event, sending info")
+            await self.write_event(self.wyoming_info.event())
+            return True
+        
+        # New streaming TTS protocol
+        if SynthesizeStart.is_type(event.type):
+            synth_start = SynthesizeStart.from_event(event)
+            voice_name = synth_start.voice.name if synth_start.voice else "alloy"
+            logging.info(f"Wyoming TTS streaming started with voice '{voice_name}'")
+            
+            # Reset streaming state
+            self.streaming_text_buffer = []
+            self.streaming_voice = voice_name
+            self.is_streaming = True
+            return True
+        
+        if SynthesizeChunk.is_type(event.type):
+            synth_chunk = SynthesizeChunk.from_event(event)
+            logging.info(f"Received text chunk: '{synth_chunk.text}'")
+            self.streaming_text_buffer.append(synth_chunk.text)
+            return True
+        
+        if SynthesizeStop.is_type(event.type):
+            logging.info("Wyoming TTS streaming stopped, generating audio")
+            
+            # Combine all text chunks
+            full_text = "".join(self.streaming_text_buffer)
+            voice_name = self.streaming_voice or "alloy"
+            
+            # Generate and stream audio
+            await self._generate_and_stream_audio(full_text, voice_name)
+            
+            # Send stopped event
+            await self.write_event(SynthesizeStopped().event())
+            
+            # Reset state
+            self.streaming_text_buffer = []
+            self.streaming_voice = None
+            self.is_streaming = False
+            
+            return True
+        
+        # Legacy non-streaming protocol (for backward compatibility)
+        if Synthesize.is_type(event.type):
+            synthesize = Synthesize.from_event(event)
+            
+            # Extract voice name from SynthesizeVoice object
+            voice_name = synthesize.voice.name if synthesize.voice else "alloy"
+            logging.info(f"Wyoming TTS request (legacy): '{synthesize.text}' with voice '{voice_name}'")
+            
+            # Generate and stream audio
+            await self._generate_and_stream_audio(synthesize.text, voice_name)
+            
+            return True
+        else:
+            logging.warning(f"Unexpected event type: {event.type}")
+            return True
+    
+    async def _generate_and_stream_audio(self, text: str, voice_name: str):
+        """Generate audio and stream it back via Wyoming protocol"""
+        # Load model to device if needed
+        if args.low_vram and "cuda" in DEVICE:
+            await asyncio.get_event_loop().run_in_executor(
+                None, handle_vram_change, DEVICE
+            )
+        
+        # Get voice audio prompt
+        audio_prompt_path = VOICE_MAP.get(voice_name, args.audio_prompt)
+        
+        if audio_prompt_path is None:
+            logging.error("No audio prompt configured")
+            return
+        
+        # Prepare conditionals
+        global current_audio_prompt_path
+        if audio_prompt_path != current_audio_prompt_path or args.low_vram:
+            await asyncio.get_event_loop().run_in_executor(
+                None, get_voice_conds_for_audio_prompt, audio_prompt_path
+            )
+            current_audio_prompt_path = audio_prompt_path
+        
+        # Generate audio
+        kwargs = dict(
+            exaggeration=args.exaggeration,
+            temperature=args.temperature,
+            cfg_weight=0.5,
+            min_p=args.min_p,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+        )
+        
+        if LANGUAGE != "en":
+            kwargs["language_id"] = LANGUAGE
+        
+        # Send audio start event
+        await self.write_event(
+            AudioStart(
+                rate=self.sample_rate,
+                width=self.sample_width,
+                channels=self.channels
+            ).event()
+        )
+        
+        # Split into sentences for streaming
+        sentences = split_sentences(text)
+        
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            
+            logging.info(f"Generating sentence: {sentence}")
+            
+            # Generate audio in executor to not block event loop
+            def generate_audio():
+                set_seed(12345)
+                with inference_lock:
+                    return chatterbox_model.generate(
+                        sentence,
+                        language_id="en",
+                        **kwargs
+                    )
+            
+            wav_tensor = await asyncio.get_event_loop().run_in_executor(
+                None, generate_audio
+            )
+            
+            # Convert to PCM16
+            waveform_cpu = wav_tensor.squeeze(0).cpu()
+            waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
+            audio_bytes = waveform_int16.numpy().tobytes()
+            
+            # Send audio in chunks (Wyoming typically uses chunks)
+            chunk_size = 8192
+            for i in range(0, len(audio_bytes), chunk_size):
+                chunk = audio_bytes[i:i + chunk_size]
+                await self.write_event(
+                    AudioChunk(
+                        rate=self.sample_rate,
+                        width=self.sample_width,
+                        channels=self.channels,
+                        audio=chunk
+                    ).event()
+                )
+        
+        # Send audio stop event
+        await self.write_event(AudioStop().event())
+        
+        # Cleanup
+        await asyncio.get_event_loop().run_in_executor(None, _cleanup)
+        logging.info("Finished Wyoming TTS generation")
+
+
+async def wyoming_server_main():
+    """Main function for Wyoming server"""
+    # Create Wyoming info with available voices
+    wyoming_info = Info(
+        tts=[
+            TtsProgram(
+                name="chatterbox",
+                version="1.0.0",
+                description="Chatterbox TTS with voice cloning",
+                attribution=Attribution(
+                    name="Chatterbox",
+                    url="https://github.com/chatterbox-tts/chatterbox"
+                ),
+                installed=True,
+                supports_synthesize_streaming=True,  # Enable new streaming protocol
+                voices=[
+                    TtsVoice(
+                        name=voice_name,
+                        version="1.0.0",
+                        description=f"Chatterbox voice: {voice_name}",
+                        attribution=Attribution(name="Chatterbox", url=""),
+                        installed=True,
+                        languages=[LANGUAGE]
+                    )
+                    for voice_name in VOICE_MAP.keys()
+                ]
+            )
+        ]
+    )
+
+    logging.info(f"Wyoming server starting on port {args.wyoming_port}")
+
+    # Run server with properly structured handler factory
+    await AsyncServer.from_uri(f"tcp://0.0.0.0:{args.wyoming_port}").run(
+        partial(ChatterboxWyomingEventHandler, wyoming_info)
+    )
+
+
 def main():
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO if args.debug else logging.WARNING,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Start Flask server in a separate thread
+    from threading import Thread
+    
+    def run_flask():
+        app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=False)
+    
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    print(f"Flask server started on {args.host}:{args.port}")
+    print(f"Starting Wyoming server on port {args.wyoming_port}...")
+    
+    # Run Wyoming server
+    try:
+        asyncio.run(wyoming_server_main())
+    except KeyboardInterrupt:
+        print("\nShutting down servers...")
 
 if __name__ == "__main__":
     main()
