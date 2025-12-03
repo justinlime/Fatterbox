@@ -1,6 +1,7 @@
 import argparse
 import gc
 import io
+import os
 import random
 import numpy as np
 import pysbd
@@ -9,33 +10,48 @@ from flask import Flask, request, send_file, jsonify, render_template, render_te
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 import torchaudio
+from threading import Lock
 
 # Set up Flask app
 app = Flask(__name__)
 
+# Global lock for model inference to prevent concurrent CUDA graph issues
+inference_lock = Lock()
+
 parser = argparse.ArgumentParser(description="OpenAI-compatible TTS server for Chatterbox.")
 
 # Server arguments
-parser.add_argument("--host", type=str, default="0.0.0.0", help="Host for the server.")
-parser.add_argument("--port", type=int, default=5002, help="Port for the server.")
-parser.add_argument("--model-name", type=str, default="chatterbox-tts", help="Name of the model to report in API responses.")
-parser.add_argument("--debug", action="store_true", help="Run the server in debug mode.")
-parser.add_argument("--device", type=str, default="cpu", help="Device to run server on. Options: cpu, cuda, cuda:0, cuda:1, mps")
-parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, default=False, help="Whether to unload model to cpu when not generating.")
-parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=False, help="Enable audio streaming sentence by sentence.")
-parser.add_argument("--model_path", type=str, default=None, help="Path to a local directory containing model checkpoints.")
-parser.add_argument("--language_id", type=str, default="en", help="Two letter language code: Arabic (ar), Danish (da), German (de), Greek (el), English (en), Spanish (es), Finnish (fi), French (fr), Hebrew (he), Hindi (hi), Italian (it), Japanese (ja), Korean (ko), Malay (ms), Dutch (nl), Norwegian (no), Polish (pl), Portuguese (pt), Russian (ru), Swedish (sv), Swahili (sw), Turkish (tr), Chinese (zh)")
+parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host for the server.")
+parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5002")), help="Port for the server.")
+parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "").lower() == "true", help="Run the server in debug mode.")
+parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cpu"), help="Device to run server on. Options: cpu, cuda, cuda:0, cuda:1, mps")
+parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, default=os.getenv("LOW_VRAM", "").lower() == "true", help="Whether to unload model to cpu when not generating.")
+parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=os.getenv("STREAM", "").lower() == "true", help="Enable audio streaming sentence by sentence.")
+parser.add_argument("--model_path", type=str, default=os.getenv("MODEL_PATH"), help="Path to a local directory containing model checkpoints.")
+parser.add_argument("--language_id", type=str, default=os.getenv("LANGUAGE_ID", "en"), help="Two letter language code: Arabic (ar), Danish (da), German (de), Greek (el), English (en), Spanish (es), Finnish (fi), French (fr), Hebrew (he), Hindi (hi), Italian (it), Japanese (ja), Korean (ko), Malay (ms), Dutch (nl), Norwegian (no), Polish (pl), Portuguese (pt), Russian (ru), Swedish (sv), Swahili (sw), Turkish (tr), Chinese (zh)")
+parser.add_argument("--audio_prompt", type=str, default=os.getenv("AUDIO_PROMPT"), help="Default audio prompt path for voice cloning.")
+
 # Chatterbox generation arguments with reasonable defaults
-parser.add_argument("--exaggeration", type=float, default=0.5, help="Exaggeration level (0.5 is neutral).")
-parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature.")
-parser.add_argument("--min-p", type=float, default=0.05, help="min_p for nucleus sampling.")
-parser.add_argument("--top-p", type=float, default=1.0, help="top_p for nucleus sampling (1.0 disables it).")
-parser.add_argument("--repetition-penalty", type=float, default=1.2, help="Repetition penalty.")
+parser.add_argument("--exaggeration", type=float, default=float(os.getenv("EXAGGERATION", "0.5")), help="Exaggeration level (0.5 is neutral).")
+parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE", "0.8")), help="Sampling temperature.")
+parser.add_argument("--min-p", type=float, default=float(os.getenv("MIN_P", "0.05")), help="min_p for nucleus sampling.")
+parser.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P", "1.0")), help="top_p for nucleus sampling (1.0 disables it).")
+parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("REPETITION_PENALTY", "1.2")), help="Repetition penalty.")
 
 args = parser.parse_args()
 segmenter = pysbd.Segmenter(language="en", clean=True)
 current_audio_prompt_path = None
 cached_conds = {}
+
+# OpenAI voice name mapping to audio prompt paths
+VOICE_MAP = {
+    "alloy": args.audio_prompt,
+    "echo": args.audio_prompt,
+    "fable": args.audio_prompt,
+    "onyx": args.audio_prompt,
+    "nova": args.audio_prompt,
+    "shimmer": args.audio_prompt,
+}
 
 DEVICE = args.device
 if "cuda" in DEVICE:
@@ -45,7 +61,7 @@ if "mps" in DEVICE:
     if not torch.backends.mps.is_available():
         DEVICE = "cpu"
         
-LANGUAGE = args.language_id if args.language_id else "en" # Probably need to check if language in supported languages
+LANGUAGE = args.language_id if args.language_id else "en"
 
 def load_chatterbox_tts_model(device):
     tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
@@ -76,7 +92,7 @@ def handle_vram_change(desired_device: str):
                 if chatterbox_model:
                     del chatterbox_model
                 gc.collect()
-                chatterbox_model = load_chatterbox_tts_model(desired_device)#ChatterboxTTS.from_pretrained(desired_device)
+                chatterbox_model = load_chatterbox_tts_model(desired_device)
                 CURRENT_DEVICE = desired_device
                 print(f"Switched ChatterboxTTS model to {desired_device}.")
 
@@ -138,18 +154,27 @@ def openai_tts():
     payload = request.get_json(force=True)
     
     text = payload.get("input", "")
-    audio_prompt_path = payload.get("voice", None)
+    voice = payload.get("voice", "alloy")
+    model = payload.get("model", "tts-1")
     cfg_weight = payload.get("speed", 0.5)
     stream = payload.get("stream", args.stream)
 
     if not text:
         return jsonify({"error":"Missing input in request"}), 400
 
+    # Map OpenAI voice names to audio prompt paths
+    audio_prompt_path = VOICE_MAP.get(voice, args.audio_prompt)
+    
+    # If no audio_prompt configured and voice not in map, return error
+    if audio_prompt_path is None:
+        return jsonify({"error": f"Voice '{voice}' not configured. Please set --audio_prompt or use a mapped voice."}), 400
+
     # Prepare conditionals for new wav if needed, otherwise recycle conditionals
     global current_audio_prompt_path
     if audio_prompt_path != current_audio_prompt_path or args.low_vram:
         get_voice_conds_for_audio_prompt(audio_prompt_path)
         current_audio_prompt_path = audio_prompt_path
+    
     kwargs = dict(
         exaggeration=args.exaggeration,
         temperature=args.temperature,
@@ -161,6 +186,7 @@ def openai_tts():
     # Add language_id only if not English
     if LANGUAGE != "en":
         kwargs["language_id"] = LANGUAGE
+    
     # Streaming
     if stream:
         fmt = payload.get("response_format", "pcm").lower()
@@ -169,7 +195,7 @@ def openai_tts():
         if fmt not in ['pcm', 'mp3']:
             return jsonify({"error": f"Streaming is only supported for 'pcm' and 'mp3' formats. Requested: {fmt}"}), 400
         
-        print(f"Streaming Request: text='{text}', voice='{audio_prompt_path}', speed='{cfg_weight}', format='{fmt}'")
+        print(f"Streaming Request: text='{text}', voice='{voice}', model='{model}', speed='{cfg_weight}', format='{fmt}'")
 
         def generate_stream():
             try:
@@ -182,11 +208,13 @@ def openai_tts():
                     # Always use same manual seed for consistency in generation
                     set_seed(12345)
                     
-                    wav_tensor = chatterbox_model.generate(
-                        sentence,
-                        language_id="en",
-                        **kwargs
-                    )
+                    # Use lock to prevent concurrent CUDA graph access
+                    with inference_lock:
+                        wav_tensor = chatterbox_model.generate(
+                            sentence,
+                            language_id="en",
+                            **kwargs
+                        )
                     waveform_cpu = wav_tensor.squeeze(0).cpu()
 
                     if fmt == 'pcm':
@@ -207,7 +235,7 @@ def openai_tts():
     # Non-Streaming
     else:
         fmt = payload.get("response_format", "mp3").lower()
-        print(f"Request: text='{text}', voice='{audio_prompt_path}', speed='{cfg_weight}', format='{fmt}'")
+        print(f"Request: text='{text}', voice='{voice}', model='{model}', speed='{cfg_weight}', format='{fmt}'")
 
         sentences = split_sentences(text)
         audio_chunks = []
@@ -216,12 +244,14 @@ def openai_tts():
             # Always use same manual seed for consistency in generation
             set_seed(12345) 
 
-            # Call generate with unpacked kwargs
-            wav_tensor = chatterbox_model.generate(
-                sentence,
-                language_id="en",
-                **kwargs
-            )
+            # Use lock to prevent concurrent CUDA graph access
+            with inference_lock:
+                # Call generate with unpacked kwargs
+                wav_tensor = chatterbox_model.generate(
+                    sentence,
+                    language_id="en",
+                    **kwargs
+                )
             audio_chunks.append(wav_tensor)
         
         final_audio = torch.cat(audio_chunks, dim=-1) if len(audio_chunks) > 1 else audio_chunks[0]
@@ -260,12 +290,19 @@ def openai_list_models():
     Return a list of available models, for OpenAI client compatibility.
     """
     return jsonify({
+        "object": "list",
         "data": [
             {
-                "id": args.model_name,
+                "id": "tts-1",
                 "object": "model",
-                "created": 1677610600,  # Placeholder timestamp
-                "owned_by": "user"
+                "created": 1677610600,
+                "owned_by": "openai"
+            },
+            {
+                "id": "tts-1-hd",
+                "object": "model",
+                "created": 1677610600,
+                "owned_by": "openai"
             }
         ]
     })
