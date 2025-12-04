@@ -1,664 +1,593 @@
+"""
+Chatterbox TTS Server
+OpenAI-compatible API + Wyoming Protocol support
+"""
 import argparse
 import gc
 import io
+import logging
 import os
 import random
+from functools import partial
+from threading import Lock, Thread
+from typing import Dict, List, Optional
+
+import asyncio
 import numpy as np
 import pysbd
 import torch
-from flask import Flask, request, send_file, jsonify, render_template, render_template_string, Response
+import torchaudio
+from flask import Flask, Response, jsonify, render_template, request, send_file
+
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
-import torchaudio
-from threading import Lock
-import asyncio
-import logging
-from functools import partial
 
-# Wyoming protocol imports
 from wyoming.info import Info, TtsProgram, TtsVoice, Attribution
 from wyoming.server import AsyncServer, AsyncEventHandler
 from wyoming.tts import Synthesize, SynthesizeStart, SynthesizeChunk, SynthesizeStop, SynthesizeStopped
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 
-# Set up Flask app
-app = Flask(__name__)
 
-# Global lock for model inference to prevent concurrent CUDA graph issues
-inference_lock = Lock()
+# ============================================================================
+# Configuration
+# ============================================================================
 
-parser = argparse.ArgumentParser(description="OpenAI-compatible TTS server for Chatterbox with Wyoming protocol support.")
-
-# Server arguments
-parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host for the server.")
-parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5002")), help="Port for the Flask server.")
-parser.add_argument("--wyoming-port", type=int, default=int(os.getenv("WYOMING_PORT", "10200")), help="Port for the Wyoming protocol server.")
-parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "").lower() == "true", help="Run the server in debug mode.")
-parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cpu"), help="Device to run server on. Options: cpu, cuda, cuda:0, cuda:1, mps")
-parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, default=os.getenv("LOW_VRAM", "").lower() == "true", help="Whether to unload model to cpu when not generating.")
-parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=os.getenv("STREAM", "").lower() == "true", help="Enable audio streaming sentence by sentence.")
-parser.add_argument("--model_path", type=str, default=os.getenv("MODEL_PATH"), help="Path to a local directory containing model checkpoints.")
-parser.add_argument("--language_id", type=str, default=os.getenv("LANGUAGE_ID", "en"), help="Two letter language code: Arabic (ar), Danish (da), German (de), Greek (el), English (en), Spanish (es), Finnish (fi), French (fr), Hebrew (he), Hindi (hi), Italian (it), Japanese (ja), Korean (ko), Malay (ms), Dutch (nl), Norwegian (no), Polish (pl), Portuguese (pt), Russian (ru), Swedish (sv), Swahili (sw), Turkish (tr), Chinese (zh)")
-parser.add_argument("--audio_prompt", type=str, default=os.getenv("AUDIO_PROMPT"), help="Default audio prompt path for voice cloning.")
-
-# Chatterbox generation arguments with reasonable defaults
-parser.add_argument("--exaggeration", type=float, default=float(os.getenv("EXAGGERATION", "0.5")), help="Exaggeration level (0.5 is neutral).")
-parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE", "0.8")), help="Sampling temperature.")
-parser.add_argument("--min-p", type=float, default=float(os.getenv("MIN_P", "0.05")), help="min_p for nucleus sampling.")
-parser.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P", "1.0")), help="top_p for nucleus sampling (1.0 disables it).")
-parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("REPETITION_PENALTY", "1.2")), help="Repetition penalty.")
-
-# T3 optimization argument
-parser.add_argument("--t3-dtype", type=str, default=os.getenv("T3_DTYPE", "bfloat16"), choices=["float32", "float16", "bfloat16"], help="Data type for T3 model (bfloat16 recommended for most modern GPUs).")
-
-args = parser.parse_args()
-segmenter = pysbd.Segmenter(language="en", clean=True)
-current_audio_prompt_path = None
-cached_conds = {}
-
-# OpenAI voice name mapping to audio prompt paths
-VOICE_MAP = {
-    "alloy": args.audio_prompt,
-    "echo": args.audio_prompt,
-    "fable": args.audio_prompt,
-    "onyx": args.audio_prompt,
-    "nova": args.audio_prompt,
-    "shimmer": args.audio_prompt,
-}
-
-DEVICE = args.device
-if "cuda" in DEVICE:
-    if not torch.cuda.is_available():
-        DEVICE = "cpu"
-if "mps" in DEVICE:
-    if not torch.backends.mps.is_available():
-        DEVICE = "cpu"
+class Config:
+    """Central configuration management"""
+    def __init__(self, args):
+        self.host = args.host
+        self.port = args.port
+        self.wyoming_port = args.wyoming_port
+        self.debug = args.debug
+        self.device = self._validate_device(args.device)
+        self.low_vram = args.low_vram
+        self.stream = args.stream
+        self.model_path = args.model_path
+        self.language_id = args.language_id or "en"
+        self.audio_prompt = args.audio_prompt
         
-LANGUAGE = args.language_id if args.language_id else "en"
-
-def load_chatterbox_tts_model(device):
-    tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-    return tts_model
-
-def t3_to(model: ChatterboxTTS, dtype):
-    """Convert T3 model to specified dtype for optimization"""
-    model.t3.to(dtype=dtype)
-    model.conds.t3.to(dtype=dtype)
-    torch.cuda.empty_cache()
-    return model
-
-# Load the Chatterbox model
-print(f"Loading Chatterbox TTS...")
-chatterbox_model = load_chatterbox_tts_model(DEVICE)
-
-# Apply T3 dtype optimization if on CUDA
-if "cuda" in DEVICE and args.t3_dtype != "float32":
-    dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32
-    }
-    target_dtype = dtype_map[args.t3_dtype]
-    print(f"Optimizing T3 model with dtype: {args.t3_dtype}")
-    t3_to(chatterbox_model, target_dtype)
-
-# OPTIMIZATION 2: Torch Compile (PyTorch 2.0+)
-if "cuda" in DEVICE and hasattr(torch, 'compile'):
-    print("Compiling model with torch.compile for additional speedup...")
-    try:
-        chatterbox_model.t3 = torch.compile(
-            chatterbox_model.t3, 
-            mode="reduce-overhead",
-            fullgraph=True
-        )
-        print("Model compiled successfully!")
-    except Exception as e:
-        print(f"Compilation failed (non-critical): {e}")
-
-# OPTIMIZATION 3: Hardware-specific optimizations
-if "cuda" in DEVICE:
-    # Enable TF32 for Ampere+ GPUs (RTX 30xx, A100, etc.)
-    if torch.cuda.get_device_capability()[0] >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("TF32 enabled for Ampere+ GPU")
+        # Generation parameters
+        self.exaggeration = args.exaggeration
+        self.temperature = args.temperature
+        self.min_p = args.min_p
+        self.top_p = args.top_p
+        self.repetition_penalty = args.repetition_penalty
+        self.t3_dtype = args.t3_dtype
+        
+        # T3 optimization params
+        self.t3_params = {
+            "initial_forward_pass_backend": "eager",
+            "generate_token_backend": "cudagraphs-manual",
+            "stride_length": 4,
+            "skip_when_1": True,
+        }
+        
+        # Voice mapping
+        self.voice_map = {
+            "alloy": self.audio_prompt,
+            "echo": self.audio_prompt,
+            "fable": self.audio_prompt,
+            "onyx": self.audio_prompt,
+            "nova": self.audio_prompt,
+            "shimmer": self.audio_prompt,
+        }
     
-    # Enable cuDNN benchmarking for optimized convolutions
-    torch.backends.cudnn.benchmark = True
-    print("cuDNN benchmark mode enabled")
+    @staticmethod
+    def _validate_device(device: str) -> str:
+        """Validate and fallback device selection"""
+        if "cuda" in device and not torch.cuda.is_available():
+            logging.warning("CUDA requested but not available, falling back to CPU")
+            return "cpu"
+        if "mps" in device and not torch.backends.mps.is_available():
+            logging.warning("MPS requested but not available, falling back to CPU")
+            return "cpu"
+        return device
 
-CURRENT_DEVICE = DEVICE
 
-generation_count = 0
+# ============================================================================
+# Model Manager
+# ============================================================================
 
-# Hardcoded T3 optimization params for best performance
-T3_PARAMS = {
-    "initial_forward_pass_backend": "eager",
-    "generate_token_backend": "cudagraphs-manual",
-    "stride_length": 4,
-    "skip_when_1": True,
-}
-
-print(f"T3 optimization params: {T3_PARAMS}")
-
-# Warmup generation if using CUDA
-if "cuda" in DEVICE:
-    print("Running warmup generation...")
-    try:
-        # First warmup to initialize CUDA graphs
-        _ = chatterbox_model.generate(
-            "Warmup generation for CUDA graph initialization.",
-            t3_params=T3_PARAMS
-        )
-        # Second generation at full speed
-        _ = chatterbox_model.generate(
-            "Second warmup for full speed.",
-            t3_params=T3_PARAMS
-        )
-        print("Warmup complete!")
-    except Exception as e:
-        print(f"Warmup failed (non-critical): {e}")
-
-def set_seed(seed: int):
-    """Set random seeds for reproducibility."""
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-
-def handle_vram_change(desired_device: str):
-    global chatterbox_model, CURRENT_DEVICE
-    if torch.cuda.is_available():
-        if "cuda" in desired_device:
-            if "cuda" not in CURRENT_DEVICE:
-                if chatterbox_model:
-                    del chatterbox_model
-                gc.collect()
-                chatterbox_model = load_chatterbox_tts_model(desired_device)
-                
-                # Re-apply T3 optimization after loading
-                if args.t3_dtype != "float32":
-                    dtype_map = {
-                        "float16": torch.float16,
-                        "bfloat16": torch.bfloat16,
-                    }
-                    t3_to(chatterbox_model, dtype_map[args.t3_dtype])
-                
-                # Re-apply torch.compile if available
-                if hasattr(torch, 'compile'):
-                    try:
-                        chatterbox_model.t3 = torch.compile(
-                            chatterbox_model.t3,
-                            mode="reduce-overhead",
-                            fullgraph=True
-                        )
-                    except Exception:
-                        pass
-                
-                CURRENT_DEVICE = desired_device
-                print(f"Switched ChatterboxTTS model to {desired_device}.")
-
-        elif "cpu" in desired_device:
-            if "cpu" not in CURRENT_DEVICE:
-                del chatterbox_model
-                torch.cuda.empty_cache()
-                gc.collect()
-                chatterbox_model = None
-                CURRENT_DEVICE = desired_device
-                print("Unloaded ChatterboxTTS model")
-
-if args.low_vram and "cuda" in DEVICE:
-    handle_vram_change("cpu")
-
-def _cleanup():
-    """Handles VRAM and garbage collection after a generation task."""
-    if args.low_vram and "cuda" in DEVICE:
-        handle_vram_change("cpu")
-
-    # Even if low vram is off, clear cache after 5 generations to prevent VRAM usage from infinitely increasing
-    global generation_count
-    generation_count += 1
-    if generation_count >= 5 and not args.low_vram and "cuda" in DEVICE:
-        generation_count = 0
-        torch.cuda.empty_cache()
-        gc.collect()
-        print("CUDA cache cleared after 5 generations.")
-
-def split_sentences(input_text: str) -> list:
-    if len(input_text) <= 150:
-        return [input_text]
-    return segmenter.segment(input_text)
-
-def get_voice_conds_for_audio_prompt(audio_prompt_path):
-    global chatterbox_model
-    # Check if voice conds already exist
-    voice_conds = cached_conds.get(str(audio_prompt_path))
-    # If not, add them to our cache
-    if not voice_conds:
-        print("Cached conditionals not found, generating new conditionals.")
-        chatterbox_model.prepare_conditionals(audio_prompt_path)
-        cached_conds[str(audio_prompt_path)] = chatterbox_model.conds
-    else:
-        print("Cached conditionals found; reusing.")
-        chatterbox_model.conds = voice_conds
-
-def generate_audio_batch(sentences, **kwargs):
-    """
-    Generate audio for multiple sentences using batch generation if available,
-    otherwise fall back to sequential generation.
-    """
-    if len(sentences) > 1 and hasattr(chatterbox_model, 'generate_batch'):
-        # Use batch generation if model supports it
-        print(f"Using batch generation for {len(sentences)} sentences")
-        audio_chunks = chatterbox_model.generate_batch(sentences, **kwargs)
-    else:
-        # Fallback to sequential generation
-        audio_chunks = []
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
-            # Always use same manual seed for consistency in generation
+class ModelManager:
+    """Manages model loading, optimization, and device management"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.model: Optional[ChatterboxMultilingualTTS] = None
+        self.current_device = config.device
+        self.inference_lock = Lock()
+        self.generation_count = 0
+        self.cached_conds: Dict[str, any] = {}
+        self.current_audio_prompt = None
+        
+        self._initialize_model()
+    
+    def _initialize_model(self):
+        """Load and optimize the model"""
+        logging.info("Loading Chatterbox TTS model...")
+        self.model = ChatterboxMultilingualTTS.from_pretrained(device=self.config.device)
+        
+        if "cuda" in self.config.device:
+            self._apply_cuda_optimizations()
+            self._warmup()
+        
+        if self.config.low_vram:
+            self._move_to_device("cpu")
+    
+    def _apply_cuda_optimizations(self):
+        """Apply CUDA-specific optimizations"""
+        # T3 dtype optimization
+        if self.config.t3_dtype != "float32":
+            dtype_map = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }
+            logging.info(f"Optimizing T3 model with dtype: {self.config.t3_dtype}")
+            self.model.t3.to(dtype=dtype_map[self.config.t3_dtype])
+            self.model.conds.t3.to(dtype=dtype_map[self.config.t3_dtype])
+            torch.cuda.empty_cache()
+        
+        # Torch compile
+        if hasattr(torch, 'compile'):
+            try:
+                logging.info("Compiling model with torch.compile...")
+                self.model.t3 = torch.compile(
+                    self.model.t3,
+                    mode="reduce-overhead",
+                    fullgraph=True
+                )
+            except Exception as e:
+                logging.warning(f"Compilation failed: {e}")
+        
+        # Hardware-specific optimizations
+        if torch.cuda.get_device_capability()[0] >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logging.info("TF32 enabled for Ampere+ GPU")
+        
+        torch.backends.cudnn.benchmark = True
+    
+    def _warmup(self):
+        """Warmup generations for CUDA graph initialization"""
+        logging.info("Running warmup generation...")
+        try:
+            for text in ["Warmup generation for CUDA graph initialization.", 
+                        "Second warmup for full speed."]:
+                self.model.generate(text, t3_params=self.config.t3_params)
+            logging.info("Warmup complete!")
+        except Exception as e:
+            logging.warning(f"Warmup failed: {e}")
+    
+    def _move_to_device(self, device: str):
+        """Move model to specified device"""
+        if device == self.current_device:
+            return
+        
+        if "cuda" in device and self.model is None:
+            self._initialize_model()
+        elif "cpu" in device and self.model is not None:
+            del self.model
+            torch.cuda.empty_cache()
+            gc.collect()
+            self.model = None
+            logging.info("Unloaded model from VRAM")
+        
+        self.current_device = device
+    
+    def prepare_for_generation(self):
+        """Prepare model for generation (load to device if needed)"""
+        if self.config.low_vram and "cuda" in self.config.device:
+            self._move_to_device(self.config.device)
+    
+    def cleanup_after_generation(self):
+        """Cleanup after generation"""
+        if self.config.low_vram and "cuda" in self.config.device:
+            self._move_to_device("cpu")
+        
+        # Periodic cache clearing
+        self.generation_count += 1
+        if self.generation_count >= 5 and not self.config.low_vram and "cuda" in self.config.device:
+            self.generation_count = 0
+            torch.cuda.empty_cache()
+            gc.collect()
+            logging.debug("CUDA cache cleared")
+    
+    def prepare_voice_conditionals(self, audio_prompt_path: str):
+        """Load or retrieve cached voice conditionals"""
+        if audio_prompt_path == self.current_audio_prompt and not self.config.low_vram:
+            return
+        
+        voice_conds = self.cached_conds.get(audio_prompt_path)
+        
+        if voice_conds:
+            logging.debug("Using cached conditionals")
+            self.model.conds = voice_conds
+        else:
+            logging.info("Generating new conditionals")
+            self.model.prepare_conditionals(audio_prompt_path)
+            self.cached_conds[audio_prompt_path] = self.model.conds
+        
+        self.current_audio_prompt = audio_prompt_path
+    
+    def generate(self, text: str, **kwargs) -> torch.Tensor:
+        """Generate audio with thread safety"""
+        set_seed(12345)
+        with self.inference_lock:
+            return self.model.generate(text, **kwargs)
+    
+    def generate_batch(self, texts: List[str], **kwargs) -> List[torch.Tensor]:
+        """Generate audio batch if supported"""
+        if len(texts) > 1 and hasattr(self.model, 'generate_batch'):
+            logging.info(f"Using batch generation for {len(texts)} sentences")
             set_seed(12345)
+            with self.inference_lock:
+                return self.model.generate_batch(texts, **kwargs)
+        
+        # Fallback to sequential
+        return [self.generate(text, **kwargs) for text in texts if text.strip()]
+
+
+# ============================================================================
+# Audio Processing
+# ============================================================================
+
+class AudioProcessor:
+    """Handles audio processing and format conversion"""
+    
+    MIMETYPES = {
+        "wav": "audio/wav",
+        "mp3": "audio/mpeg",
+        "opus": "audio/ogg",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "pcm": "audio/L16",
+    }
+    
+    def __init__(self, sample_rate: int = 22050):
+        self.sample_rate = sample_rate
+        self.segmenter = pysbd.Segmenter(language="en", clean=True)
+    
+    def split_sentences(self, text: str) -> List[str]:
+        """Split text into sentences"""
+        if len(text) <= 150:
+            return [text]
+        return self.segmenter.segment(text)
+    
+    @staticmethod
+    def process_waveform(wav_tensor: torch.Tensor) -> torch.Tensor:
+        """Clamp waveform to prevent clipping"""
+        waveform = wav_tensor.squeeze(0).cpu()
+        return torch.clamp(waveform, -1.0, 1.0)
+    
+    def to_pcm16(self, waveform: torch.Tensor) -> bytes:
+        """Convert waveform to PCM16 bytes"""
+        waveform_int16 = (waveform * 32767).to(torch.int16)
+        return waveform_int16.numpy().tobytes()
+    
+    def save_audio(self, waveform: torch.Tensor, format: str) -> io.BytesIO:
+        """Save audio to buffer in specified format"""
+        buffer = io.BytesIO()
+        
+        if format == 'pcm':
+            buffer.write(self.to_pcm16(waveform))
+        else:
+            waveform_2d = waveform.unsqueeze(0)
+            format_args = {"format": format}
             
-            # Use lock to prevent concurrent CUDA graph access
-            with inference_lock:
-                wav_tensor = chatterbox_model.generate(sentence, **kwargs)
-            audio_chunks.append(wav_tensor)
-    
-    return audio_chunks
-
-@app.route("/")
-def index():
-    return render_template(
-        "index.html",
-    )
-
-@app.route("/v1/audio/speech", methods=["POST"])
-def openai_tts():
-    if args.low_vram and "cuda" in DEVICE:
-        handle_vram_change(DEVICE)
-
-    payload = request.get_json(force=True)
-    
-    text = payload.get("input", "")
-    voice = payload.get("voice", "alloy")
-    model = payload.get("model", "tts-1")
-    cfg_weight = payload.get("speed", 0.5)
-    stream = payload.get("stream", args.stream)
-
-    if not text:
-        return jsonify({"error":"Missing input in request"}), 400
-
-    # Map OpenAI voice names to audio prompt paths
-    audio_prompt_path = VOICE_MAP.get(voice, args.audio_prompt)
-    
-    # If no audio_prompt configured and voice not in map, return error
-    if audio_prompt_path is None:
-        return jsonify({"error": f"Voice '{voice}' not configured. Please set --audio_prompt or use a mapped voice."}), 400
-
-    # Prepare conditionals for new wav if needed, otherwise recycle conditionals
-    global current_audio_prompt_path
-    if audio_prompt_path != current_audio_prompt_path or args.low_vram:
-        get_voice_conds_for_audio_prompt(audio_prompt_path)
-        current_audio_prompt_path = audio_prompt_path
-    
-    kwargs = dict(
-        language_id=LANGUAGE,
-        exaggeration=args.exaggeration,
-        temperature=args.temperature,
-        cfg_weight=cfg_weight,
-        min_p=args.min_p,
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty,
-        t3_params=T3_PARAMS,
-    )
-    
-    # Streaming
-    if stream:
-        fmt = payload.get("response_format", "pcm").lower()
+            if format == 'opus':
+                format_args = {"format": "ogg", "encoding": "opus"}
+            elif format == 'aac':
+                format_args = {"format": "mp4", "encoding": "aac"}
+            
+            torchaudio.save(buffer, waveform_2d, self.sample_rate, **format_args)
         
-        # Only PCM and MP3 are supported for chunked streaming
+        buffer.seek(0)
+        return buffer
+
+
+# ============================================================================
+# Flask API Server
+# ============================================================================
+
+class FlaskServer:
+    """OpenAI-compatible API server"""
+    
+    def __init__(self, model_manager: ModelManager, audio_processor: AudioProcessor, config: Config):
+        self.app = Flask(__name__)
+        self.model_manager = model_manager
+        self.audio_processor = audio_processor
+        self.config = config
+        
+        self._register_routes()
+    
+    def _register_routes(self):
+        """Register Flask routes"""
+        self.app.route("/")(self.index)
+        self.app.route("/v1/audio/speech", methods=["POST"])(self.openai_tts)
+        self.app.route("/v1/models", methods=["GET"])(self.list_models)
+    
+    def index(self):
+        """Home page"""
+        return render_template("index.html")
+    
+    def openai_tts(self):
+        """OpenAI-compatible TTS endpoint"""
+        payload = request.get_json(force=True)
+        
+        # Extract parameters
+        text = payload.get("input", "")
+        voice = payload.get("voice", "alloy")
+        cfg_weight = payload.get("speed", 0.5)
+        stream = payload.get("stream", self.config.stream)
+        fmt = payload.get("response_format", "mp3" if not stream else "pcm").lower()
+        
+        if not text:
+            return jsonify({"error": "Missing input in request"}), 400
+        
+        # Get audio prompt
+        audio_prompt_path = self.config.voice_map.get(voice, self.config.audio_prompt)
+        if not audio_prompt_path:
+            return jsonify({"error": f"Voice '{voice}' not configured"}), 400
+        
+        # Prepare model
+        self.model_manager.prepare_for_generation()
+        self.model_manager.prepare_voice_conditionals(audio_prompt_path)
+        
+        # Generation kwargs
+        kwargs = {
+            "language_id": self.config.language_id,
+            "exaggeration": self.config.exaggeration,
+            "temperature": self.config.temperature,
+            "cfg_weight": cfg_weight,
+            "min_p": self.config.min_p,
+            "top_p": self.config.top_p,
+            "repetition_penalty": self.config.repetition_penalty,
+            "t3_params": self.config.t3_params,
+        }
+        
+        logging.info(f"{'Streaming' if stream else 'Non-streaming'} request: text='{text[:50]}...', voice='{voice}', format='{fmt}'")
+        
+        if stream:
+            return self._stream_response(text, fmt, kwargs)
+        else:
+            return self._full_response(text, fmt, kwargs)
+    
+    def _stream_response(self, text: str, fmt: str, kwargs: dict):
+        """Generate streaming response"""
         if fmt not in ['pcm', 'mp3']:
-            return jsonify({"error": f"Streaming is only supported for 'pcm' and 'mp3' formats. Requested: {fmt}"}), 400
+            return jsonify({"error": f"Streaming only supports 'pcm' and 'mp3' formats"}), 400
         
-        print(f"Streaming Request: text='{text}', voice='{voice}', model='{model}', speed='{cfg_weight}', format='{fmt}'")
-
         def generate_stream():
             try:
-                sentences = split_sentences(text)
+                sentences = self.audio_processor.split_sentences(text)
                 for sentence in sentences:
                     if not sentence.strip():
                         continue
                     
-                    print(f"Streaming sentence: {sentence}")
-                    # Always use same manual seed for consistency in generation
-                    set_seed(12345)
+                    wav_tensor = self.model_manager.generate(sentence, **kwargs)
+                    waveform = self.audio_processor.process_waveform(wav_tensor)
                     
-                    # Use lock to prevent concurrent CUDA graph access
-                    with inference_lock:
-                        wav_tensor = chatterbox_model.generate(sentence, **kwargs)
-                    waveform_cpu = wav_tensor.squeeze(0).cpu()
-                    
-                    # Clamp values to prevent clipping
-                    waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
-
                     if fmt == 'pcm':
-                        waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
-                        yield waveform_int16.numpy().tobytes()
+                        yield self.audio_processor.to_pcm16(waveform)
                     elif fmt == 'mp3':
-                        buffer = io.BytesIO()
-                        waveform_2d = waveform_cpu.unsqueeze(0)
-                        torchaudio.save(buffer, waveform_2d, chatterbox_model.sr, format="mp3")
+                        buffer = self.audio_processor.save_audio(waveform, 'mp3')
                         yield buffer.getvalue()
             finally:
-                _cleanup()
-                print("Finished streaming response.")
-
-        mimetype = "audio/L16" if fmt == 'pcm' else "audio/mpeg"
+                self.model_manager.cleanup_after_generation()
+        
+        mimetype = self.audio_processor.MIMETYPES[fmt]
         return Response(generate_stream(), mimetype=mimetype)
-
-    # Non-Streaming
-    else:
-        fmt = payload.get("response_format", "mp3").lower()
-        print(f"Request: text='{text}', voice='{voice}', model='{model}', speed='{cfg_weight}', format='{fmt}'")
-
-        sentences = split_sentences(text)
-        
-        # Use batch generation if available
-        audio_chunks = generate_audio_batch(sentences, **kwargs)
-        
-        final_audio = torch.cat(audio_chunks, dim=-1) if len(audio_chunks) > 1 else audio_chunks[0]
-        waveform_cpu = final_audio.squeeze(0).cpu()
-        
-        # Clamp values to prevent clipping
-        waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
-        
-        mimetypes = {
-            "wav": "audio/wav", "mp3": "audio/mpeg", "opus": "audio/ogg",
-            "aac": "audio/aac", "flac": "audio/flac", "pcm": "audio/L16",
-        }
-
-        if fmt not in mimetypes:
+    
+    def _full_response(self, text: str, fmt: str, kwargs: dict):
+        """Generate full response"""
+        if fmt not in self.audio_processor.MIMETYPES:
             return jsonify({"error": f"Unsupported format: {fmt}"}), 400
-
-        mimetype = mimetypes[fmt]
-        buffer = io.BytesIO()
-
-        if fmt == 'pcm':
-            waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
-            buffer.write(waveform_int16.numpy().tobytes())
-        else:
-            waveform_2d = waveform_cpu.unsqueeze(0)
-            format_args = {"format": fmt}
-            if fmt == 'opus':
-                format_args = {"format": "ogg", "encoding": "opus"}
-            elif fmt == 'aac':
-                format_args = {"format": "mp4", "encoding": "aac"}
-            torchaudio.save(buffer, waveform_2d, chatterbox_model.sr, **format_args)
-
-        buffer.seek(0)
-        _cleanup()
-        return send_file(buffer, mimetype=mimetype)
-
-@app.route("/v1/models", methods=["GET"])
-def openai_list_models():
-    """
-    Return a list of available models, for OpenAI client compatibility.
-    """
-    return jsonify({
-        "object": "list",
-        "data": [
-            {
-                "id": "tts-1",
-                "object": "model",
-                "created": 1677610600,
-                "owned_by": "openai"
-            },
-            {
-                "id": "tts-1-hd",
-                "object": "model",
-                "created": 1677610600,
-                "owned_by": "openai"
-            }
-        ]
-    })
+        
+        try:
+            sentences = self.audio_processor.split_sentences(text)
+            audio_chunks = self.model_manager.generate_batch(sentences, **kwargs)
+            
+            final_audio = torch.cat(audio_chunks, dim=-1) if len(audio_chunks) > 1 else audio_chunks[0]
+            waveform = self.audio_processor.process_waveform(final_audio)
+            
+            buffer = self.audio_processor.save_audio(waveform, fmt)
+            mimetype = self.audio_processor.MIMETYPES[fmt]
+            
+            return send_file(buffer, mimetype=mimetype)
+        finally:
+            self.model_manager.cleanup_after_generation()
+    
+    def list_models(self):
+        """List available models"""
+        return jsonify({
+            "object": "list",
+            "data": [
+                {"id": "tts-1", "object": "model", "created": 1677610600, "owned_by": "openai"},
+                {"id": "tts-1-hd", "object": "model", "created": 1677610600, "owned_by": "openai"}
+            ]
+        })
+    
+    def run(self):
+        """Run Flask server"""
+        self.app.run(
+            host=self.config.host,
+            port=self.config.port,
+            debug=self.config.debug,
+            use_reloader=False
+        )
 
 
 # ============================================================================
-# Wyoming Protocol Implementation
+# Wyoming Protocol Server
 # ============================================================================
 
-class ChatterboxWyomingEventHandler(AsyncEventHandler):
+class WyomingEventHandler(AsyncEventHandler):
     """Handles Wyoming protocol events for TTS"""
     
-    def __init__(self, wyoming_info: Info, *args, **kwargs):
+    def __init__(self, wyoming_info: Info, model_manager: ModelManager, 
+                 audio_processor: AudioProcessor, config: Config, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.wyoming_info = wyoming_info
-        self.sample_rate = 22050  # Chatterbox default sample rate
-        self.sample_width = 2  # 16-bit audio
-        self.channels = 1  # Mono
+        self.model_manager = model_manager
+        self.audio_processor = audio_processor
+        self.config = config
+        
+        # Audio format
+        self.sample_rate = 22050
+        self.sample_width = 2
+        self.channels = 1
+        self.chunk_size = 1024
         
         # Streaming state
         self.streaming_text_buffer = []
         self.streaming_voice = None
         self.is_streaming = False
-        
+    
     async def handle_event(self, event: Event) -> bool:
         """Handle incoming Wyoming protocol events"""
-        # Handle describe events - Home Assistant queries server capabilities
         if event.type == "describe":
-            logging.info("Received describe event, sending info")
+            logging.info("Received describe event")
             await self.write_event(self.wyoming_info.event())
             return True
         
-        # New streaming TTS protocol
+        # Streaming protocol
         if SynthesizeStart.is_type(event.type):
             synth_start = SynthesizeStart.from_event(event)
-            voice_name = synth_start.voice.name if synth_start.voice else "alloy"
-            logging.info(f"Wyoming TTS streaming started with voice '{voice_name}'")
-            
-            # Reset streaming state
+            self.streaming_voice = synth_start.voice.name if synth_start.voice else "alloy"
             self.streaming_text_buffer = []
-            self.streaming_voice = voice_name
             self.is_streaming = True
+            logging.info(f"Wyoming TTS streaming started with voice '{self.streaming_voice}'")
             return True
         
         if SynthesizeChunk.is_type(event.type):
             synth_chunk = SynthesizeChunk.from_event(event)
-            logging.info(f"Received text chunk: '{synth_chunk.text}'")
             self.streaming_text_buffer.append(synth_chunk.text)
+            logging.debug(f"Received text chunk: '{synth_chunk.text}'")
             return True
         
         if SynthesizeStop.is_type(event.type):
-            logging.info("Wyoming TTS streaming stopped, generating audio")
-            
-            # Combine all text chunks
+            logging.info("Wyoming TTS streaming stopped")
             full_text = "".join(self.streaming_text_buffer)
-            voice_name = self.streaming_voice or "alloy"
-            
-            # Generate and stream audio
-            await self._generate_and_stream_audio(full_text, voice_name)
-            
-            # Send stopped event
+            await self._generate_and_stream_audio(full_text, self.streaming_voice or "alloy")
             await self.write_event(SynthesizeStopped().event())
             
-            # Reset state
             self.streaming_text_buffer = []
             self.streaming_voice = None
             self.is_streaming = False
-            
             return True
         
-        # Legacy non-streaming protocol (for backward compatibility)
-        # Only handle this if we're not in a streaming session
+        # Legacy protocol
         if Synthesize.is_type(event.type):
             if self.is_streaming:
-                logging.warning("Ignoring legacy Synthesize event during streaming session")
+                logging.warning("Ignoring legacy Synthesize during streaming session")
                 return True
-                
-            synthesize = Synthesize.from_event(event)
             
-            # Extract voice name from SynthesizeVoice object
+            synthesize = Synthesize.from_event(event)
             voice_name = synthesize.voice.name if synthesize.voice else "alloy"
             logging.info(f"Wyoming TTS request (legacy): '{synthesize.text}' with voice '{voice_name}'")
-            
-            # Generate and stream audio
             await self._generate_and_stream_audio(synthesize.text, voice_name)
-            
             return True
         
         logging.warning(f"Unexpected event type: {event.type}")
         return True
     
     async def _generate_and_stream_audio(self, text: str, voice_name: str):
-        """Generate audio and stream it back via Wyoming protocol"""
-        # Load model to device if needed
-        if args.low_vram and "cuda" in DEVICE:
-            await asyncio.get_event_loop().run_in_executor(
-                None, handle_vram_change, DEVICE
-            )
+        """Generate audio and stream via Wyoming protocol"""
+        loop = asyncio.get_event_loop()
+        
+        # Prepare model
+        if self.config.low_vram and "cuda" in self.config.device:
+            await loop.run_in_executor(None, self.model_manager.prepare_for_generation)
         
         # Get voice audio prompt
-        audio_prompt_path = VOICE_MAP.get(voice_name, args.audio_prompt)
-        
-        if audio_prompt_path is None:
+        audio_prompt_path = self.config.voice_map.get(voice_name, self.config.audio_prompt)
+        if not audio_prompt_path:
             logging.error("No audio prompt configured")
             return
         
-        # Prepare conditionals
-        global current_audio_prompt_path
-        if audio_prompt_path != current_audio_prompt_path or args.low_vram:
-            await asyncio.get_event_loop().run_in_executor(
-                None, get_voice_conds_for_audio_prompt, audio_prompt_path
-            )
-            current_audio_prompt_path = audio_prompt_path
-        
-        # Generate audio
-        kwargs = dict(
-            language_id=LANGUAGE,
-            exaggeration=args.exaggeration,
-            temperature=args.temperature,
-            cfg_weight=0.5,
-            min_p=args.min_p,
-            top_p=args.top_p,
-            repetition_penalty=args.repetition_penalty,
-            t3_params=T3_PARAMS,
+        await loop.run_in_executor(
+            None, self.model_manager.prepare_voice_conditionals, audio_prompt_path
         )
         
-        # Send audio start event
-        await self.write_event(
-            AudioStart(
+        # Generation kwargs
+        kwargs = {
+            "language_id": self.config.language_id,
+            "exaggeration": self.config.exaggeration,
+            "temperature": self.config.temperature,
+            "cfg_weight": 0.5,
+            "min_p": self.config.min_p,
+            "top_p": self.config.top_p,
+            "repetition_penalty": self.config.repetition_penalty,
+            "t3_params": self.config.t3_params,
+        }
+        
+        # Send audio start
+        await self.write_event(AudioStart(
+            rate=self.sample_rate,
+            width=self.sample_width,
+            channels=self.channels
+        ).event())
+        
+        # Generate and stream
+        sentences = [s for s in self.audio_processor.split_sentences(text) if s.strip()]
+        
+        # Try batch generation
+        if len(sentences) > 1 and hasattr(self.model_manager.model, 'generate_batch'):
+            def batch_generate():
+                return self.model_manager.generate_batch(sentences, **kwargs)
+            
+            audio_chunks = await loop.run_in_executor(None, batch_generate)
+            
+            for wav_tensor in audio_chunks:
+                await self._stream_audio_chunk(wav_tensor)
+        else:
+            # Sequential generation
+            for sentence in sentences:
+                logging.debug(f"Generating: {sentence}")
+                
+                def generate_sentence():
+                    return self.model_manager.generate(sentence, **kwargs)
+                
+                wav_tensor = await loop.run_in_executor(None, generate_sentence)
+                await self._stream_audio_chunk(wav_tensor)
+        
+        # Send audio stop
+        await self.write_event(AudioStop().event())
+        await loop.run_in_executor(None, self.model_manager.cleanup_after_generation)
+        logging.info("Finished Wyoming TTS generation")
+    
+    async def _stream_audio_chunk(self, wav_tensor: torch.Tensor):
+        """Stream a single audio chunk"""
+        waveform = self.audio_processor.process_waveform(wav_tensor)
+        audio_bytes = self.audio_processor.to_pcm16(waveform)
+        
+        # Stream in chunks with slight delay
+        for i in range(0, len(audio_bytes), self.chunk_size):
+            chunk = audio_bytes[i:i + self.chunk_size]
+            await self.write_event(AudioChunk(
                 rate=self.sample_rate,
                 width=self.sample_width,
-                channels=self.channels
-            ).event()
-        )
-        
-        # Split into sentences for streaming
-        sentences = split_sentences(text)
-        sentences = [s for s in sentences if s.strip()]  # Filter empty sentences
-        
-        # Ensure chunk size is aligned to sample boundaries
-        bytes_per_sample = self.sample_width * self.channels
-        chunk_size = 1024  # Smaller chunks = lower initial latency
-        chunk_size = (chunk_size // bytes_per_sample) * bytes_per_sample
-        
-        # OPTIMIZATION 1: Try batch generation if available
-        if len(sentences) > 1 and hasattr(chatterbox_model, 'generate_batch'):
-            logging.info(f"Using batch generation for {len(sentences)} sentences")
+                channels=self.channels,
+                audio=chunk
+            ).event())
             
-            def generate_audio_batch():
-                set_seed(12345)
-                with inference_lock:
-                    return chatterbox_model.generate_batch(sentences, **kwargs)
-            
-            audio_chunks = await asyncio.get_event_loop().run_in_executor(
-                None, generate_audio_batch
-            )
-            
-            # Stream all generated audio
-            for wav_tensor in audio_chunks:
-                waveform_cpu = wav_tensor.squeeze(0).cpu()
-                waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
-                
-                max_val = waveform_cpu.abs().max().item()
-                if max_val > 0.95:
-                    logging.warning(f"Audio near clipping threshold: max={max_val:.3f}")
-                
-                waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
-                audio_bytes = waveform_int16.numpy().tobytes()
-                
-                for i in range(0, len(audio_bytes), chunk_size):
-                    chunk = audio_bytes[i:i + chunk_size]
-                    await self.write_event(
-                        AudioChunk(
-                            rate=self.sample_rate,
-                            width=self.sample_width,
-                            channels=self.channels,
-                            audio=chunk
-                        ).event()
-                    )
-                    if i + chunk_size < len(audio_bytes):
-                        await asyncio.sleep(0.0005)
-        else:
-            # Fallback to sequential generation
-            for sentence in sentences:
-                logging.info(f"Generating sentence: {sentence}")
-                
-                # Generate audio in executor to not block event loop
-                def generate_audio():
-                    set_seed(12345)
-                    with inference_lock:
-                        return chatterbox_model.generate(sentence, **kwargs)
-                
-                wav_tensor = await asyncio.get_event_loop().run_in_executor(
-                    None, generate_audio
-                )
-                
-                # Convert to PCM16
-                waveform_cpu = wav_tensor.squeeze(0).cpu()
-                waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
-                
-                # Check for potential clipping issues
-                max_val = waveform_cpu.abs().max().item()
-                if max_val > 0.95:
-                    logging.warning(f"Audio near clipping threshold: max={max_val:.3f}")
-                
-                waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
-                audio_bytes = waveform_int16.numpy().tobytes()
-                
-                # Send audio in aligned chunks with slight delay
-                for i in range(0, len(audio_bytes), chunk_size):
-                    chunk = audio_bytes[i:i + chunk_size]
-                    await self.write_event(
-                        AudioChunk(
-                            rate=self.sample_rate,
-                            width=self.sample_width,
-                            channels=self.channels,
-                            audio=chunk
-                        ).event()
-                    )
-                    
-                    if i + chunk_size < len(audio_bytes):
-                        await asyncio.sleep(0.0005)
-        
-        # Send audio stop event
-        await self.write_event(AudioStop().event())
-        
-        # Cleanup
-        await asyncio.get_event_loop().run_in_executor(None, _cleanup)
-        logging.info("Finished Wyoming TTS generation")
+            if i + self.chunk_size < len(audio_bytes):
+                await asyncio.sleep(0.0005)
 
 
-async def wyoming_server_main():
-    """Main function for Wyoming server"""
-    # Create Wyoming info with available voices
-    wyoming_info = Info(
-        tts=[
-            TtsProgram(
+class WyomingServer:
+    """Wyoming protocol server"""
+    
+    def __init__(self, model_manager: ModelManager, audio_processor: AudioProcessor, config: Config):
+        self.model_manager = model_manager
+        self.audio_processor = audio_processor
+        self.config = config
+    
+    def _create_wyoming_info(self) -> Info:
+        """Create Wyoming info with available voices"""
+        return Info(
+            tts=[TtsProgram(
                 name="chatterbox",
                 version="1.0.0",
                 description="Chatterbox TTS with voice cloning",
@@ -667,7 +596,7 @@ async def wyoming_server_main():
                     url="https://github.com/chatterbox-tts/chatterbox"
                 ),
                 installed=True,
-                supports_synthesize_streaming=True,  # Enable new streaming protocol
+                supports_synthesize_streaming=True,
                 voices=[
                     TtsVoice(
                         name=voice_name,
@@ -675,46 +604,103 @@ async def wyoming_server_main():
                         description=f"Chatterbox voice: {voice_name}",
                         attribution=Attribution(name="Chatterbox", url=""),
                         installed=True,
-                        languages=[LANGUAGE]
+                        languages=[self.config.language_id]
                     )
-                    for voice_name in VOICE_MAP.keys()
+                    for voice_name in self.config.voice_map.keys()
                 ]
-            )
-        ]
+            )]
+        )
+    
+    async def run(self):
+        """Run Wyoming server"""
+        wyoming_info = self._create_wyoming_info()
+        logging.info(f"Wyoming server starting on port {self.config.wyoming_port}")
+        
+        await AsyncServer.from_uri(f"tcp://0.0.0.0:{self.config.wyoming_port}").run(
+            partial(WyomingEventHandler, wyoming_info, self.model_manager, 
+                   self.audio_processor, self.config)
+        )
+
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+def set_seed(seed: int):
+    """Set random seeds for reproducibility"""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="OpenAI-compatible TTS server for Chatterbox with Wyoming protocol support."
     )
+    
+    # Server arguments
+    parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5002")))
+    parser.add_argument("--wyoming-port", type=int, default=int(os.getenv("WYOMING_PORT", "10200")))
+    parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "").lower() == "true")
+    parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cpu"))
+    parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, 
+                       default=os.getenv("LOW_VRAM", "").lower() == "true")
+    parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
+                       default=os.getenv("STREAM", "").lower() == "true")
+    parser.add_argument("--model_path", type=str, default=os.getenv("MODEL_PATH"))
+    parser.add_argument("--language_id", type=str, default=os.getenv("LANGUAGE_ID", "en"))
+    parser.add_argument("--audio_prompt", type=str, default=os.getenv("AUDIO_PROMPT"))
+    
+    # Generation arguments
+    parser.add_argument("--exaggeration", type=float, default=float(os.getenv("EXAGGERATION", "0.5")))
+    parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE", "0.8")))
+    parser.add_argument("--min-p", type=float, default=float(os.getenv("MIN_P", "0.05")))
+    parser.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P", "1.0")))
+    parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("REPETITION_PENALTY", "1.2")))
+    parser.add_argument("--t3-dtype", type=str, default=os.getenv("T3_DTYPE", "bfloat16"),
+                       choices=["float32", "float16", "bfloat16"])
+    
+    return parser.parse_args()
 
-    logging.info(f"Wyoming server starting on port {args.wyoming_port}")
 
-    # Run server with properly structured handler factory
-    await AsyncServer.from_uri(f"tcp://0.0.0.0:{args.wyoming_port}").run(
-        partial(ChatterboxWyomingEventHandler, wyoming_info)
-    )
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    # Set up logging
+    """Main entry point"""
+    args = parse_args()
+    
+    # Setup logging
     logging.basicConfig(
         level=logging.INFO if args.debug else logging.WARNING,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Start Flask server in a separate thread
-    from threading import Thread
+    # Initialize components
+    config = Config(args)
+    model_manager = ModelManager(config)
+    audio_processor = AudioProcessor()
     
-    def run_flask():
-        app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=False)
-    
-    flask_thread = Thread(target=run_flask, daemon=True)
+    # Start Flask server in background thread
+    flask_server = FlaskServer(model_manager, audio_processor, config)
+    flask_thread = Thread(target=flask_server.run, daemon=True)
     flask_thread.start()
     
-    print(f"Flask server started on {args.host}:{args.port}")
-    print(f"Starting Wyoming server on port {args.wyoming_port}...")
+    logging.info(f"Flask server started on {config.host}:{config.port}")
+    logging.info(f"Starting Wyoming server on port {config.wyoming_port}...")
     
     # Run Wyoming server
     try:
-        asyncio.run(wyoming_server_main())
+        wyoming_server = WyomingServer(model_manager, audio_processor, config)
+        asyncio.run(wyoming_server.run())
     except KeyboardInterrupt:
-        print("\nShutting down servers...")
+        logging.info("Shutting down servers...")
+
 
 if __name__ == "__main__":
     main()
