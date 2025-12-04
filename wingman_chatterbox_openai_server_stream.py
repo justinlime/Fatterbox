@@ -7,13 +7,12 @@ import gc
 import io
 import logging
 import os
-import random
 from functools import partial
 from threading import Lock, Thread
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import asyncio
-import numpy as np
 import pysbd
 import torch
 import torchaudio
@@ -41,7 +40,6 @@ class Config:
         self.wyoming_port = args.wyoming_port
         self.debug = args.debug
         self.device = self._validate_device(args.device)
-        self.low_vram = args.low_vram
         self.stream = args.stream
         self.model_path = args.model_path
         self.language_id = args.language_id or "en"
@@ -95,7 +93,6 @@ class ModelManager:
     def __init__(self, config: Config):
         self.config = config
         self.model: Optional[ChatterboxMultilingualTTS] = None
-        self.current_device = config.device
         self.inference_lock = Lock()
         self.generation_count = 0
         self.cached_conds: Dict[str, any] = {}
@@ -111,9 +108,6 @@ class ModelManager:
         if "cuda" in self.config.device:
             self._apply_cuda_optimizations()
             self._warmup()
-        
-        if self.config.low_vram:
-            self._move_to_device("cpu")
     
     def _apply_cuda_optimizations(self):
         """Apply CUDA-specific optimizations"""
@@ -159,35 +153,11 @@ class ModelManager:
         except Exception as e:
             logging.warning(f"Warmup failed: {e}")
     
-    def _move_to_device(self, device: str):
-        """Move model to specified device"""
-        if device == self.current_device:
-            return
-        
-        if "cuda" in device and self.model is None:
-            self._initialize_model()
-        elif "cpu" in device and self.model is not None:
-            del self.model
-            torch.cuda.empty_cache()
-            gc.collect()
-            self.model = None
-            logging.info("Unloaded model from VRAM")
-        
-        self.current_device = device
-    
-    def prepare_for_generation(self):
-        """Prepare model for generation (load to device if needed)"""
-        if self.config.low_vram and "cuda" in self.config.device:
-            self._move_to_device(self.config.device)
-    
     def cleanup_after_generation(self):
         """Cleanup after generation"""
-        if self.config.low_vram and "cuda" in self.config.device:
-            self._move_to_device("cpu")
-        
-        # Periodic cache clearing
+        # Periodic cache clearing to prevent VRAM usage from growing indefinitely
         self.generation_count += 1
-        if self.generation_count >= 5 and not self.config.low_vram and "cuda" in self.config.device:
+        if self.generation_count >= 5 and "cuda" in self.config.device:
             self.generation_count = 0
             torch.cuda.empty_cache()
             gc.collect()
@@ -195,7 +165,8 @@ class ModelManager:
     
     def prepare_voice_conditionals(self, audio_prompt_path: str):
         """Load or retrieve cached voice conditionals"""
-        if audio_prompt_path == self.current_audio_prompt and not self.config.low_vram:
+        if audio_prompt_path == self.current_audio_prompt:
+            logging.debug("Using existing conditionals")
             return
         
         voice_conds = self.cached_conds.get(audio_prompt_path)
@@ -212,7 +183,6 @@ class ModelManager:
     
     def generate(self, text: str, **kwargs) -> torch.Tensor:
         """Generate audio with thread safety"""
-        set_seed(12345)
         with self.inference_lock:
             return self.model.generate(text, **kwargs)
     
@@ -220,7 +190,6 @@ class ModelManager:
         """Generate audio batch if supported"""
         if len(texts) > 1 and hasattr(self.model, 'generate_batch'):
             logging.info(f"Using batch generation for {len(texts)} sentences")
-            set_seed(12345)
             with self.inference_lock:
                 return self.model.generate_batch(texts, **kwargs)
         
@@ -318,7 +287,7 @@ class FlaskServer:
         # Extract parameters
         text = payload.get("input", "")
         voice = payload.get("voice", "alloy")
-        cfg_weight = payload.get("speed", 0.5)
+        cfg_weight = payload.get("speed", 1.0)
         stream = payload.get("stream", self.config.stream)
         fmt = payload.get("response_format", "mp3" if not stream else "pcm").lower()
         
@@ -331,7 +300,6 @@ class FlaskServer:
             return jsonify({"error": f"Voice '{voice}' not configured"}), 400
         
         # Prepare model
-        self.model_manager.prepare_for_generation()
         self.model_manager.prepare_voice_conditionals(audio_prompt_path)
         
         # Generation kwargs
@@ -346,7 +314,7 @@ class FlaskServer:
             "t3_params": self.config.t3_params,
         }
         
-        logging.info(f"{'Streaming' if stream else 'Non-streaming'} request: text='{text[:50]}...', voice='{voice}', format='{fmt}'")
+        logging.info(f"OpenAI {'streaming' if stream else 'non-streaming'} request: text='{text[:50]}...', voice='{voice}', cfg_weight={cfg_weight}")
         
         if stream:
             return self._stream_response(text, fmt, kwargs)
@@ -423,7 +391,7 @@ class FlaskServer:
 # ============================================================================
 
 class WyomingEventHandler(AsyncEventHandler):
-    """Handles Wyoming protocol events for TTS"""
+    """Handles Wyoming protocol events for TTS with parallel prefetching"""
     
     def __init__(self, wyoming_info: Info, model_manager: ModelManager, 
                  audio_processor: AudioProcessor, config: Config, *args, **kwargs):
@@ -437,7 +405,10 @@ class WyomingEventHandler(AsyncEventHandler):
         self.sample_rate = 22050
         self.sample_width = 2
         self.channels = 1
-        self.chunk_size = 1024
+        self.chunk_size = 2048  # Larger chunks for better throughput
+        
+        # Thread pool for parallel generation (max 3 concurrent as per wyoming_openai)
+        self.executor = ThreadPoolExecutor(max_workers=3)
         
         # Streaming state
         self.streaming_text_buffer = []
@@ -493,12 +464,8 @@ class WyomingEventHandler(AsyncEventHandler):
         return True
     
     async def _generate_and_stream_audio(self, text: str, voice_name: str):
-        """Generate audio and stream via Wyoming protocol"""
+        """Generate audio with parallel prefetching and stream via Wyoming protocol"""
         loop = asyncio.get_event_loop()
-        
-        # Prepare model
-        if self.config.low_vram and "cuda" in self.config.device:
-            await loop.run_in_executor(None, self.model_manager.prepare_for_generation)
         
         # Get voice audio prompt
         audio_prompt_path = self.config.voice_map.get(voice_name, self.config.audio_prompt)
@@ -506,21 +473,24 @@ class WyomingEventHandler(AsyncEventHandler):
             logging.error("No audio prompt configured")
             return
         
+        # Prepare voice conditionals in executor to not block
         await loop.run_in_executor(
-            None, self.model_manager.prepare_voice_conditionals, audio_prompt_path
+            self.executor, self.model_manager.prepare_voice_conditionals, audio_prompt_path
         )
         
-        # Generation kwargs
+        # Generation kwargs - MUST match OpenAI endpoint exactly
         kwargs = {
             "language_id": self.config.language_id,
             "exaggeration": self.config.exaggeration,
             "temperature": self.config.temperature,
-            "cfg_weight": 0.5,
+            "cfg_weight": 1.0,  # Match OpenAI default
             "min_p": self.config.min_p,
             "top_p": self.config.top_p,
             "repetition_penalty": self.config.repetition_penalty,
             "t3_params": self.config.t3_params,
         }
+        
+        logging.info(f"Wyoming request: text='{text[:50]}...', voice='{voice_name}', cfg_weight=1.0")
         
         # Send audio start
         await self.write_event(AudioStart(
@@ -529,40 +499,56 @@ class WyomingEventHandler(AsyncEventHandler):
             channels=self.channels
         ).event())
         
-        # Generate and stream
+        # Split into sentences
         sentences = [s for s in self.audio_processor.split_sentences(text) if s.strip()]
         
-        # Try batch generation
-        if len(sentences) > 1 and hasattr(self.model_manager.model, 'generate_batch'):
-            def batch_generate():
-                return self.model_manager.generate_batch(sentences, **kwargs)
-            
-            audio_chunks = await loop.run_in_executor(None, batch_generate)
-            
-            for wav_tensor in audio_chunks:
-                await self._stream_audio_chunk(wav_tensor)
-        else:
-            # Sequential generation
-            for sentence in sentences:
-                logging.debug(f"Generating: {sentence}")
-                
-                def generate_sentence():
-                    return self.model_manager.generate(sentence, **kwargs)
-                
-                wav_tensor = await loop.run_in_executor(None, generate_sentence)
-                await self._stream_audio_chunk(wav_tensor)
+        if not sentences:
+            await self.write_event(AudioStop().event())
+            return
+        
+        # Use parallel prefetching with async queue for low latency
+        # This mimics wyoming_openai's approach of prefetching up to 3 requests
+        await self._parallel_generate_and_stream(sentences, kwargs, loop)
         
         # Send audio stop
         await self.write_event(AudioStop().event())
-        await loop.run_in_executor(None, self.model_manager.cleanup_after_generation)
+        await loop.run_in_executor(self.executor, self.model_manager.cleanup_after_generation)
         logging.info("Finished Wyoming TTS generation")
+    
+    async def _parallel_generate_and_stream(self, sentences: List[str], kwargs: dict, loop):
+        """Generate sentences in parallel (up to 3) and stream sequentially"""
+        # Queue to hold generated audio futures
+        futures = []
+        
+        # Submit up to 3 generation tasks at a time
+        for i, sentence in enumerate(sentences):
+            # Wait if we have 3 tasks in flight
+            if len(futures) >= 3:
+                # Pop and stream the first completed task
+                wav_tensor = await futures.pop(0)
+                await self._stream_audio_chunk(wav_tensor)
+            
+            # Submit next generation task
+            logging.debug(f"Submitting generation for sentence {i+1}/{len(sentences)}: {sentence[:30]}...")
+            
+            # Create a wrapper function that properly unpacks kwargs
+            def generate_with_kwargs(text=sentence, params=kwargs):
+                return self.model_manager.generate(text, **params)
+            
+            future = loop.run_in_executor(self.executor, generate_with_kwargs)
+            futures.append(future)
+        
+        # Stream remaining futures in order
+        for future in futures:
+            wav_tensor = await future
+            await self._stream_audio_chunk(wav_tensor)
     
     async def _stream_audio_chunk(self, wav_tensor: torch.Tensor):
         """Stream a single audio chunk"""
         waveform = self.audio_processor.process_waveform(wav_tensor)
         audio_bytes = self.audio_processor.to_pcm16(waveform)
         
-        # Stream in chunks with slight delay
+        # Stream in larger chunks for better throughput, minimal delay
         for i in range(0, len(audio_bytes), self.chunk_size):
             chunk = audio_bytes[i:i + self.chunk_size]
             await self.write_event(AudioChunk(
@@ -572,8 +558,9 @@ class WyomingEventHandler(AsyncEventHandler):
                 audio=chunk
             ).event())
             
+            # Small delay to prevent overwhelming the client
             if i + self.chunk_size < len(audio_bytes):
-                await asyncio.sleep(0.0005)
+                await asyncio.sleep(0.0001)
 
 
 class WyomingServer:
@@ -626,15 +613,6 @@ class WyomingServer:
 # Utilities
 # ============================================================================
 
-def set_seed(seed: int):
-    """Set random seeds for reproducibility"""
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-
-
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -647,8 +625,6 @@ def parse_args():
     parser.add_argument("--wyoming-port", type=int, default=int(os.getenv("WYOMING_PORT", "10200")))
     parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "").lower() == "true")
     parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cpu"))
-    parser.add_argument("--low_vram", action=argparse.BooleanOptionalAction, 
-                       default=os.getenv("LOW_VRAM", "").lower() == "true")
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
                        default=os.getenv("STREAM", "").lower() == "true")
     parser.add_argument("--model_path", type=str, default=os.getenv("MODEL_PATH"))
