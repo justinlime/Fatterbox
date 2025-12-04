@@ -103,6 +103,31 @@ if "cuda" in DEVICE and args.t3_dtype != "float32":
     print(f"Optimizing T3 model with dtype: {args.t3_dtype}")
     t3_to(chatterbox_model, target_dtype)
 
+# OPTIMIZATION 2: Torch Compile (PyTorch 2.0+)
+if "cuda" in DEVICE and hasattr(torch, 'compile'):
+    print("Compiling model with torch.compile for additional speedup...")
+    try:
+        chatterbox_model.t3 = torch.compile(
+            chatterbox_model.t3, 
+            mode="reduce-overhead",
+            fullgraph=True
+        )
+        print("Model compiled successfully!")
+    except Exception as e:
+        print(f"Compilation failed (non-critical): {e}")
+
+# OPTIMIZATION 3: Hardware-specific optimizations
+if "cuda" in DEVICE:
+    # Enable TF32 for Ampere+ GPUs (RTX 30xx, A100, etc.)
+    if torch.cuda.get_device_capability()[0] >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("TF32 enabled for Ampere+ GPU")
+    
+    # Enable cuDNN benchmarking for optimized convolutions
+    torch.backends.cudnn.benchmark = True
+    print("cuDNN benchmark mode enabled")
+
 CURRENT_DEVICE = DEVICE
 
 generation_count = 0
@@ -162,6 +187,17 @@ def handle_vram_change(desired_device: str):
                     }
                     t3_to(chatterbox_model, dtype_map[args.t3_dtype])
                 
+                # Re-apply torch.compile if available
+                if hasattr(torch, 'compile'):
+                    try:
+                        chatterbox_model.t3 = torch.compile(
+                            chatterbox_model.t3,
+                            mode="reduce-overhead",
+                            fullgraph=True
+                        )
+                    except Exception:
+                        pass
+                
                 CURRENT_DEVICE = desired_device
                 print(f"Switched ChatterboxTTS model to {desired_device}.")
 
@@ -209,6 +245,31 @@ def get_voice_conds_for_audio_prompt(audio_prompt_path):
         print("Cached conditionals found; reusing.")
         chatterbox_model.conds = voice_conds
 
+def generate_audio_batch(sentences, **kwargs):
+    """
+    Generate audio for multiple sentences using batch generation if available,
+    otherwise fall back to sequential generation.
+    """
+    if len(sentences) > 1 and hasattr(chatterbox_model, 'generate_batch'):
+        # Use batch generation if model supports it
+        print(f"Using batch generation for {len(sentences)} sentences")
+        audio_chunks = chatterbox_model.generate_batch(sentences, **kwargs)
+    else:
+        # Fallback to sequential generation
+        audio_chunks = []
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            # Always use same manual seed for consistency in generation
+            set_seed(12345)
+            
+            # Use lock to prevent concurrent CUDA graph access
+            with inference_lock:
+                wav_tensor = chatterbox_model.generate(sentence, **kwargs)
+            audio_chunks.append(wav_tensor)
+    
+    return audio_chunks
+
 @app.route("/")
 def index():
     return render_template(
@@ -245,6 +306,7 @@ def openai_tts():
         current_audio_prompt_path = audio_prompt_path
     
     kwargs = dict(
+        language_id=LANGUAGE,
         exaggeration=args.exaggeration,
         temperature=args.temperature,
         cfg_weight=cfg_weight,
@@ -253,9 +315,6 @@ def openai_tts():
         repetition_penalty=args.repetition_penalty,
         t3_params=T3_PARAMS,
     )
-    # Add language_id only if not English
-    if LANGUAGE != "en":
-        kwargs["language_id"] = LANGUAGE
     
     # Streaming
     if stream:
@@ -280,12 +339,11 @@ def openai_tts():
                     
                     # Use lock to prevent concurrent CUDA graph access
                     with inference_lock:
-                        wav_tensor = chatterbox_model.generate(
-                            sentence,
-                            language_id="en",
-                            **kwargs
-                        )
+                        wav_tensor = chatterbox_model.generate(sentence, **kwargs)
                     waveform_cpu = wav_tensor.squeeze(0).cpu()
+                    
+                    # Clamp values to prevent clipping
+                    waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
 
                     if fmt == 'pcm':
                         waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
@@ -308,24 +366,15 @@ def openai_tts():
         print(f"Request: text='{text}', voice='{voice}', model='{model}', speed='{cfg_weight}', format='{fmt}'")
 
         sentences = split_sentences(text)
-        audio_chunks = []
-
-        for sentence in sentences:
-            # Always use same manual seed for consistency in generation
-            set_seed(12345) 
-
-            # Use lock to prevent concurrent CUDA graph access
-            with inference_lock:
-                # Call generate with unpacked kwargs
-                wav_tensor = chatterbox_model.generate(
-                    sentence,
-                    language_id="en",
-                    **kwargs
-                )
-            audio_chunks.append(wav_tensor)
+        
+        # Use batch generation if available
+        audio_chunks = generate_audio_batch(sentences, **kwargs)
         
         final_audio = torch.cat(audio_chunks, dim=-1) if len(audio_chunks) > 1 else audio_chunks[0]
         waveform_cpu = final_audio.squeeze(0).cpu()
+        
+        # Clamp values to prevent clipping
+        waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
         
         mimetypes = {
             "wav": "audio/wav", "mp3": "audio/mpeg", "opus": "audio/ogg",
@@ -489,6 +538,7 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
         
         # Generate audio
         kwargs = dict(
+            language_id=LANGUAGE,
             exaggeration=args.exaggeration,
             temperature=args.temperature,
             cfg_weight=0.5,
@@ -497,9 +547,6 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
             repetition_penalty=args.repetition_penalty,
             t3_params=T3_PARAMS,
         )
-        
-        if LANGUAGE != "en":
-            kwargs["language_id"] = LANGUAGE
         
         # Send audio start event
         await self.write_event(
@@ -512,44 +559,91 @@ class ChatterboxWyomingEventHandler(AsyncEventHandler):
         
         # Split into sentences for streaming
         sentences = split_sentences(text)
+        sentences = [s for s in sentences if s.strip()]  # Filter empty sentences
         
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
+        # Ensure chunk size is aligned to sample boundaries
+        bytes_per_sample = self.sample_width * self.channels
+        chunk_size = 1024  # Smaller chunks = lower initial latency
+        chunk_size = (chunk_size // bytes_per_sample) * bytes_per_sample
+        
+        # OPTIMIZATION 1: Try batch generation if available
+        if len(sentences) > 1 and hasattr(chatterbox_model, 'generate_batch'):
+            logging.info(f"Using batch generation for {len(sentences)} sentences")
             
-            logging.info(f"Generating sentence: {sentence}")
-            
-            # Generate audio in executor to not block event loop
-            def generate_audio():
+            def generate_audio_batch():
                 set_seed(12345)
                 with inference_lock:
-                    return chatterbox_model.generate(
-                        sentence,
-                        language_id="en",
-                        **kwargs
-                    )
+                    return chatterbox_model.generate_batch(sentences, **kwargs)
             
-            wav_tensor = await asyncio.get_event_loop().run_in_executor(
-                None, generate_audio
+            audio_chunks = await asyncio.get_event_loop().run_in_executor(
+                None, generate_audio_batch
             )
             
-            # Convert to PCM16
-            waveform_cpu = wav_tensor.squeeze(0).cpu()
-            waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
-            audio_bytes = waveform_int16.numpy().tobytes()
-            
-            # Send audio in chunks (Wyoming typically uses chunks)
-            chunk_size = 1024
-            for i in range(0, len(audio_bytes), chunk_size):
-                chunk = audio_bytes[i:i + chunk_size]
-                await self.write_event(
-                    AudioChunk(
-                        rate=self.sample_rate,
-                        width=self.sample_width,
-                        channels=self.channels,
-                        audio=chunk
-                    ).event()
+            # Stream all generated audio
+            for wav_tensor in audio_chunks:
+                waveform_cpu = wav_tensor.squeeze(0).cpu()
+                waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
+                
+                max_val = waveform_cpu.abs().max().item()
+                if max_val > 0.95:
+                    logging.warning(f"Audio near clipping threshold: max={max_val:.3f}")
+                
+                waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
+                audio_bytes = waveform_int16.numpy().tobytes()
+                
+                for i in range(0, len(audio_bytes), chunk_size):
+                    chunk = audio_bytes[i:i + chunk_size]
+                    await self.write_event(
+                        AudioChunk(
+                            rate=self.sample_rate,
+                            width=self.sample_width,
+                            channels=self.channels,
+                            audio=chunk
+                        ).event()
+                    )
+                    if i + chunk_size < len(audio_bytes):
+                        await asyncio.sleep(0.0005)
+        else:
+            # Fallback to sequential generation
+            for sentence in sentences:
+                logging.info(f"Generating sentence: {sentence}")
+                
+                # Generate audio in executor to not block event loop
+                def generate_audio():
+                    set_seed(12345)
+                    with inference_lock:
+                        return chatterbox_model.generate(sentence, **kwargs)
+                
+                wav_tensor = await asyncio.get_event_loop().run_in_executor(
+                    None, generate_audio
                 )
+                
+                # Convert to PCM16
+                waveform_cpu = wav_tensor.squeeze(0).cpu()
+                waveform_cpu = torch.clamp(waveform_cpu, -1.0, 1.0)
+                
+                # Check for potential clipping issues
+                max_val = waveform_cpu.abs().max().item()
+                if max_val > 0.95:
+                    logging.warning(f"Audio near clipping threshold: max={max_val:.3f}")
+                
+                waveform_int16 = (waveform_cpu * 32767).to(torch.int16)
+                audio_bytes = waveform_int16.numpy().tobytes()
+                
+                # Send audio in aligned chunks with slight delay
+                for i in range(0, len(audio_bytes), chunk_size):
+                    chunk = audio_bytes[i:i + chunk_size]
+                    await self.write_event(
+                        AudioChunk(
+                            rate=self.sample_rate,
+                            width=self.sample_width,
+                            channels=self.channels,
+                            audio=chunk
+                        ).event()
+                    )
+                    
+                    if i + chunk_size < len(audio_bytes):
+                        await asyncio.sleep(0.0005)
         
         # Send audio stop event
         await self.write_event(AudioStop().event())
