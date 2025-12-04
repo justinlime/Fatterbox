@@ -36,12 +36,11 @@ class Config:
     """Central configuration management"""
     def __init__(self, args):
         self.host = args.host
-        self.port = args.port
+        self.openai_port = args.openai_port
         self.wyoming_port = args.wyoming_port
         self.debug = args.debug
         self.device = self._validate_device(args.device)
         self.stream = args.stream
-        self.model_path = args.model_path
         self.language_id = args.language_id or "en"
         self.audio_prompt = args.audio_prompt
         
@@ -51,7 +50,7 @@ class Config:
         self.min_p = args.min_p
         self.top_p = args.top_p
         self.repetition_penalty = args.repetition_penalty
-        self.t3_dtype = args.t3_dtype
+        self.dtype = args.dtype
         
         # T3 optimization params
         self.t3_params = {
@@ -112,14 +111,14 @@ class ModelManager:
     def _apply_cuda_optimizations(self):
         """Apply CUDA-specific optimizations"""
         # T3 dtype optimization
-        if self.config.t3_dtype != "float32":
+        if self.config.dtype != "float32":
             dtype_map = {
                 "float16": torch.float16,
                 "bfloat16": torch.bfloat16,
             }
-            logging.info(f"Optimizing T3 model with dtype: {self.config.t3_dtype}")
-            self.model.t3.to(dtype=dtype_map[self.config.t3_dtype])
-            self.model.conds.t3.to(dtype=dtype_map[self.config.t3_dtype])
+            logging.info(f"Optimizing T3 model with dtype: {self.config.dtype}")
+            self.model.t3.to(dtype=dtype_map[self.config.dtype])
+            self.model.conds.t3.to(dtype=dtype_map[self.config.dtype])
             torch.cuda.empty_cache()
         
         # Torch compile
@@ -380,7 +379,7 @@ class FlaskServer:
         """Run Flask server"""
         self.app.run(
             host=self.config.host,
-            port=self.config.port,
+            port=self.config.openai_port,
             debug=self.config.debug,
             use_reloader=False
         )
@@ -621,15 +620,14 @@ def parse_args():
     
     # Server arguments
     parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5002")))
+    parser.add_argument("--openai-port", type=int, default=int(os.getenv("OPENAI_PORT", os.getenv("PORT", "5002"))))
     parser.add_argument("--wyoming-port", type=int, default=int(os.getenv("WYOMING_PORT", "10200")))
     parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "").lower() == "true")
     parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cpu"))
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
                        default=os.getenv("STREAM", "").lower() == "true")
-    parser.add_argument("--model_path", type=str, default=os.getenv("MODEL_PATH"))
-    parser.add_argument("--language_id", type=str, default=os.getenv("LANGUAGE_ID", "en"))
-    parser.add_argument("--audio_prompt", type=str, default=os.getenv("AUDIO_PROMPT"))
+    parser.add_argument("--language-id", type=str, default=os.getenv("LANGUAGE_ID", "en"))
+    parser.add_argument("--audio-prompt", type=str, default=os.getenv("AUDIO_PROMPT"))
     
     # Generation arguments
     parser.add_argument("--exaggeration", type=float, default=float(os.getenv("EXAGGERATION", "0.5")))
@@ -637,7 +635,7 @@ def parse_args():
     parser.add_argument("--min-p", type=float, default=float(os.getenv("MIN_P", "0.05")))
     parser.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P", "1.0")))
     parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("REPETITION_PENALTY", "1.2")))
-    parser.add_argument("--t3-dtype", type=str, default=os.getenv("T3_DTYPE", "bfloat16"),
+    parser.add_argument("--dtype", type=str, default=os.getenv("DTYPE", os.getenv("T3_DTYPE", "bfloat16")),
                        choices=["float32", "float16", "bfloat16"])
     
     return parser.parse_args()
@@ -667,7 +665,7 @@ def main():
     flask_thread = Thread(target=flask_server.run, daemon=True)
     flask_thread.start()
     
-    logging.info(f"Flask server started on {config.host}:{config.port}")
+    logging.info(f"Flask server started on {config.host}:{config.openai_port}")
     logging.info(f"Starting Wyoming server on port {config.wyoming_port}...")
     
     # Run Wyoming server
