@@ -213,7 +213,7 @@ class AudioProcessor:
         "pcm": "audio/L16",
     }
     
-    def __init__(self, sample_rate: int = 22050):
+    def __init__(self, sample_rate: int = 24000):
         self.sample_rate = sample_rate
         self.segmenter = pysbd.Segmenter(language="en", clean=True)
     
@@ -402,7 +402,7 @@ class WyomingEventHandler(AsyncEventHandler):
         self.config = config
         
         # Audio format
-        self.sample_rate = 22050
+        self.sample_rate = 24000  # Chatterbox outputs at 24kHz
         self.sample_width = 2
         self.channels = 1
         self.chunk_size = 2048  # Larger chunks for better throughput
