@@ -21,6 +21,7 @@ dependencies = [
   "setuptools>=80.9.0",
   "torchcodec>=0.8.1",
   "wyoming>=1.8.0",
+  "pyrubberband>=0.4.0",
 ]
 
 [tool.uv]

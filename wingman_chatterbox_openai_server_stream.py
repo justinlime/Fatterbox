@@ -271,13 +271,8 @@ class FlaskServer:
     
     def _register_routes(self):
         """Register Flask routes"""
-        self.app.route("/")(self.index)
         self.app.route("/v1/audio/speech", methods=["POST"])(self.openai_tts)
         self.app.route("/v1/models", methods=["GET"])(self.list_models)
-    
-    def index(self):
-        """Home page"""
-        return render_template("index.html")
     
     def openai_tts(self):
         """OpenAI-compatible TTS endpoint"""
