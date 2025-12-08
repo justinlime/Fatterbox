@@ -1,4 +1,4 @@
-# Chatterbox TTS Server (Simplified)
+# Fatterbox TTS server
 
 A lightweight, production-ready TTS server that supports **OpenAI-compatible API** and **Wyoming Protocol** for voice synthesis. Built for easy deployment with Docker and minimal configuration.
 
@@ -9,7 +9,7 @@ A lightweight, production-ready TTS server that supports **OpenAI-compatible API
 Use the pre-built Docker image from Docker Hub:
 
 ```bash
-docker pull docker.io/justinlime/fatterbox
+docker pull docker.io/justinlime/fatterbox:latest
 ```
 
 > This image includes all dependencies, optimized for GPU/CPU inference and ready to run.
@@ -36,7 +36,7 @@ docker run -p 5002:5002 -p 10200:10200 \
   -e DTYPE=bfloat16 \
   -v /path/to/audio/prompt.wav:/audio/prompt.wav \
   --name chatterbox-tts \
-  docker.io/justinlime/fatterbox
+  docker.io/justinlime/fatterbox:latest
 ```
 
 > Replace `/path/to/audio/prompt.wav` with the actual path to your audio prompt file.
@@ -130,6 +130,6 @@ wyoming-client --server tcp://localhost:10200 --text "Hello world"
 
 ### Use Pre-Built Image
 ```bash
-docker pull docker.io/justinlime/fatterbox
-docker run -p 5002:5002 -p 10200:10200 -e DEVICE=cuda -v /path/to/audio/prompt.wav:/audio/prompt.wav docker.io/justinlime/fatterbox
+docker pull docker.io/justinlime/fatterbox:latest
+docker run -p 5002:5002 -p 10200:10200 -e DEVICE=cuda -v /path/to/audio/prompt.wav:/audio/prompt.wav docker.io/justinlime/fatterbox:latest
 ```
