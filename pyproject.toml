@@ -1,7 +1,7 @@
 [project]
-name = "chatterbox-streaming-openai"
-version = "0.1.4"
-description = "Chatterbox: Open Source TTS and Voice Conversion by Resemble AI"
+name = "fatterbox"
+version = "1.0.0"
+description = "fatterbox"
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.7.1",
@@ -16,6 +16,7 @@ dependencies = [
   "conformer==0.3.2",
   "safetensors",
   "pysbd",
+  "pkuseg",
   "pykakasi==2.3.0",
   "tts-webui-chatterbox-tts",
   "setuptools>=80.9.0",
@@ -24,8 +25,8 @@ dependencies = [
   "pyrubberband>=0.4.0",
 ]
 
-[tool.uv]
-extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+[tool.uv.extra-build-dependencies]
+pkuseg = ["numpy"]
 
 [tool.uv.sources]
 tts-webui-chatterbox-tts = { git = "https://github.com/rsxdalv/chatterbox.git", rev = "faster" }

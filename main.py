@@ -147,7 +147,9 @@ class ModelManager:
         try:
             for text in ["Warmup generation for CUDA graph initialization.", 
                         "Second warmup for full speed."]:
-                self.model.generate(text, t3_params=self.config.t3_params)
+                self.model.generate(text,
+                                    language_id=self.config.language_id,
+                                    t3_params=self.config.t3_params)
             logging.info("Warmup complete!")
         except Exception as e:
             logging.warning(f"Warmup failed: {e}")

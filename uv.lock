@@ -262,53 +262,6 @@ wheels = [
 ]
 
 [[package]]
-name = "chatterbox-streaming-openai"
-version = "0.1.4"
-source = { virtual = "." }
-dependencies = [
-    { name = "conformer" },
-    { name = "diffusers" },
-    { name = "flask" },
-    { name = "librosa" },
-    { name = "numpy" },
-    { name = "pykakasi" },
-    { name = "pyrubberband" },
-    { name = "pysbd" },
-    { name = "resemble-perth" },
-    { name = "s3tokenizer" },
-    { name = "safetensors" },
-    { name = "setuptools" },
-    { name = "torch" },
-    { name = "torchaudio" },
-    { name = "torchcodec" },
-    { name = "transformers" },
-    { name = "tts-webui-chatterbox-tts" },
-    { name = "wyoming" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "conformer", specifier = "==0.3.2" },
-    { name = "diffusers", specifier = "==0.29.0" },
-    { name = "flask" },
-    { name = "librosa", specifier = "==0.11.0" },
-    { name = "numpy" },
-    { name = "pykakasi", specifier = "==2.3.0" },
-    { name = "pyrubberband", specifier = ">=0.4.0" },
-    { name = "pysbd" },
-    { name = "resemble-perth", specifier = "==1.0.1" },
-    { name = "s3tokenizer" },
-    { name = "safetensors" },
-    { name = "setuptools", specifier = ">=80.9.0" },
-    { name = "torch", specifier = ">=2.7.1" },
-    { name = "torchaudio", specifier = ">=2.7.1" },
-    { name = "torchcodec", specifier = ">=0.8.1" },
-    { name = "transformers", specifier = "==4.46.3" },
-    { name = "tts-webui-chatterbox-tts", git = "https://github.com/rsxdalv/chatterbox.git?rev=faster" },
-    { name = "wyoming", specifier = ">=1.8.0" },
-]
-
-[[package]]
 name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -340,6 +293,40 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/b2/2859d16fe377f1a5dbd3ba85c68fa0e6deb5605ce86faded85b047f8cbed/conformer-0.3.2.tar.gz", hash = "sha256:32ef34fa461ff32e1c33061025c0f583884f19d2f0aba200234f4e771f777eda", size = 4663, upload-time = "2023-05-17T21:08:48.415Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/7d/714601ab8d790d77d4158af743895fb999216cb02fc6283ab8e54911a887/conformer-0.3.2-py3-none-any.whl", hash = "sha256:b957faa683e9e75061257f77407318428f2ad0fb5262bfc2e9b55fc2fffdfa03", size = 4260, upload-time = "2023-05-17T21:08:42.826Z" },
+]
+
+[[package]]
+name = "cython"
+version = "3.2.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/17/55fc687ba986f2210298fa2f60fec265fa3004c3f9a1e958ea1fe2d4e061/cython-3.2.2.tar.gz", hash = "sha256:c3add3d483acc73129a61d105389344d792c17e7c1cee24863f16416bd071634", size = 3275797, upload-time = "2025-11-30T12:48:20.942Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/ba/d785f60564a43bddbb7316134252a55d67ff6f164f0be90c4bf31482da82/cython-3.2.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d140c2701cbb8cf960300cf1b67f3b4fa9d294d32e51b85f329bff56936a82fd", size = 2951181, upload-time = "2025-11-30T12:48:39.723Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/36/277ea908bd7a326adcce5f67581926783ec11a4402ead0719e72555da2e7/cython-3.2.2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:50bbaabee733fd2780985e459fc20f655e02def83e8eff10220ad88455a34622", size = 3243194, upload-time = "2025-11-30T12:48:41.862Z" },
+    { url = "https://files.pythonhosted.org/packages/74/87/7776495bbff80bdd7754f4849bfde126b1d97741df5bc58a3a00af641747/cython-3.2.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a9509f1e9c41c86b790cff745bb31927bbc861662a3b462596d71d3d2a578abb", size = 3378096, upload-time = "2025-11-30T12:48:43.584Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/d0/fabb9f4767f7101f1c0d6b23116d6d250148f656dac152afd792756661a8/cython-3.2.2-cp311-cp311-win_amd64.whl", hash = "sha256:034ab96cb8bc8e7432bc27491f8d66f51e435b1eb21ddc03aa844be8f21ad847", size = 2768932, upload-time = "2025-11-30T12:48:45.193Z" },
+    { url = "https://files.pythonhosted.org/packages/57/0f/6fd78dc581373722bb9dedfc90c35b59ba88af988756315af227a877c7a2/cython-3.2.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:692a41c8fe06fb2dc55ca2c8d71c80c469fd16fe69486ed99f3b3cbb2d3af83f", size = 2968037, upload-time = "2025-11-30T12:48:47.279Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/52/50b6263c2fbad73aae8911ce54641ee1739d430a0592d3b3510591d7842b/cython-3.2.2-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:098590c1dc309f8a0406ade031963a95a87714296b425539f9920aebf924560d", size = 3223137, upload-time = "2025-11-30T12:48:48.951Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/44/4e34d161674c9162c6eb9ddef0cd69d41d92ae7e6dee3945fed3a6871ebe/cython-3.2.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a3898c076e9c458bcb3e4936187919fda5f5365fe4c567d35d2b003444b6f3fe", size = 3390943, upload-time = "2025-11-30T12:48:51.125Z" },
+    { url = "https://files.pythonhosted.org/packages/62/8a/ffc2df024c1341737008fbaf0fbea51ef983a7146b43b84a239f197cf005/cython-3.2.2-cp312-cp312-win_amd64.whl", hash = "sha256:2b910b89a2a71004064c5e890b9512a251eda63fae252caa0feb9835057035f9", size = 2756403, upload-time = "2025-11-30T12:48:52.929Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/4f/b5355918962ec28b376eb8e357c718d58baf32d6df7017be8d147dd4ba29/cython-3.2.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:aa24cd0bdab27ca099b2467806c684404add597c1108e07ddf7b6471653c85d7", size = 2958578, upload-time = "2025-11-30T12:48:55.354Z" },
+    { url = "https://files.pythonhosted.org/packages/46/21/a8038c8253e7a5241ed1db6d031bac586f7a502d92f487124abbc3f3e94f/cython-3.2.2-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:60f4aa425e1ff98abf8d965ae7020f06dd2cbc01dbd945137d2f9cca4ff0524a", size = 3212479, upload-time = "2025-11-30T12:48:57.567Z" },
+    { url = "https://files.pythonhosted.org/packages/57/c1/76928c07176a4402c74d5b304936ad8ee167dd04a07cf7dca545e8c25f9b/cython-3.2.2-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a473df474ba89e9fee81ee82b31062a267f9e598096b222783477e56d02ad12c", size = 3374773, upload-time = "2025-11-30T12:48:59.318Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/cb/ce641e07ba9c0cde8468e83e0214fb87020b74ba34dbb9dfe8d250a327f5/cython-3.2.2-cp313-cp313-win_amd64.whl", hash = "sha256:b4df52101209817fde7284cf779156f79142fb639b1d7840f11680ff4bb30604", size = 2754492, upload-time = "2025-11-30T12:49:01.029Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/f2/cd60f639f0fde38b71319d7b6808e1ff17a6fd7f3feaff475b866a5c0aef/cython-3.2.2-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:177faf4d61e9f2d4d2db61194ac9ec16d3fe3041c1b6830f871a01935319eeb3", size = 2969023, upload-time = "2025-11-30T12:49:02.734Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/45/6f155a9ad125536d8f30716c4d7571caae73ec811039d3ae33f9b535090d/cython-3.2.2-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8db28aef793c81dc69383b619ca508668998aaf099cd839d3cbae85184cce744", size = 3258270, upload-time = "2025-11-30T12:49:04.878Z" },
+    { url = "https://files.pythonhosted.org/packages/af/7e/022c25886fdc3ff6a005b6ae4a1c3d8522006bb738367aa5bd6c2590130b/cython-3.2.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3de43a5786033a27fae1c882feb5ff0d023c38b83356e6800c1be0bcd6cf9f11", size = 3384504, upload-time = "2025-11-30T12:49:07.078Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/07/1e3e4faf6f785d5ba053e9d6320b3f338162dc122c27a7c540b49615fc39/cython-3.2.2-cp314-cp314-win_amd64.whl", hash = "sha256:fed44d0ab2d36f1b0301c770b0dafec23bcb9700d58e7769cd6d9136b3304c11", size = 2791504, upload-time = "2025-11-30T12:49:08.729Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/69/5430879d35235ec3d5ffd778862173b6419390509ae4e37a72bdd45d9e86/cython-3.2.2-cp39-abi3-macosx_10_9_x86_64.whl", hash = "sha256:a6387e3ad31342443916db9a419509935fddd8d4cbac34aab9c895ae55326a56", size = 2874031, upload-time = "2025-11-30T12:49:18.34Z" },
+    { url = "https://files.pythonhosted.org/packages/51/fa/584f4b56b35b3e7a43dc16603dd722cb5528484da67c27136534b782827b/cython-3.2.2-cp39-abi3-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:436eb562d0affbc0b959f62f3f9c1ed251b9499e4f29c1d19514ae859894b6bf", size = 3210813, upload-time = "2025-11-30T12:49:20.55Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/d4/063c34a34d9ef54836a5dafb100b8f4fdbdaa63942913fe93f9eb93a11a2/cython-3.2.2-cp39-abi3-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:f560ff3aea5b5df93853ec7bf1a1e9623d6d511f4192f197559aca18fca43392", size = 2855611, upload-time = "2025-11-30T12:49:22.303Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/44/c0b8854e0bf6d444c88cc2050f550d964596daea20eaf1bc592fcfde2782/cython-3.2.2-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:d8c93fe128b58942832b1fcac96e48f93c2c69b569eff0d38d30fb5995fecfa0", size = 2992824, upload-time = "2025-11-30T12:49:24.02Z" },
+    { url = "https://files.pythonhosted.org/packages/90/6f/741186935c52de99acf4d7fad5c3dcf28d980b4c95d171d9618f9c399316/cython-3.2.2-cp39-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:b4fe499eed7cd70b2aa4e096b9ce2588f5e6fdf049b46d40a5e55efcde6e4904", size = 2890389, upload-time = "2025-11-30T12:49:25.783Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/79/3e487876addd0d69c148a529f3973c1942498ad39cede1e63565676064ed/cython-3.2.2-cp39-abi3-musllinux_1_2_i686.whl", hash = "sha256:14432d7f207245a3c35556155873f494784169297b28978a6204f1c60d31553e", size = 3224881, upload-time = "2025-11-30T12:49:27.484Z" },
+    { url = "https://files.pythonhosted.org/packages/15/b9/d9a103feb74d04579c6bde7b0cad6d5f45c002d843ca70788a5758707b68/cython-3.2.2-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:820c4a99dbf6b3e6c0300be42b4040b501eff0e1feeb80cfa52c48a346fb0df2", size = 3114308, upload-time = "2025-11-30T12:49:29.292Z" },
+    { url = "https://files.pythonhosted.org/packages/18/56/90445707cff62ab72136857a0134c5e50f9c73920c1a3af5218dfdae1c19/cython-3.2.2-cp39-abi3-win32.whl", hash = "sha256:826cad0ad43ab05a26e873b5d625f64d458dc739ec6fdeecab848b60a91c4252", size = 2435212, upload-time = "2025-11-30T12:49:32.179Z" },
+    { url = "https://files.pythonhosted.org/packages/44/54/25a98c2731521ac9fc18e17d79a0e7d58164d4db398f09e1bd24cdd27ed1/cython-3.2.2-cp39-abi3-win_arm64.whl", hash = "sha256:5f818d40bbcf17e2089e2de7840f0de1c0ca527acf9b044aba79d5f5d8a5bdba", size = 2440536, upload-time = "2025-11-30T12:49:34.109Z" },
+    { url = "https://files.pythonhosted.org/packages/76/f2/98fd8d0b514622a789fd2824b59bd6041b799aaeeba14a8d92d52f6654dd/cython-3.2.2-py3-none-any.whl", hash = "sha256:13b99ecb9482aff6a6c12d1ca6feef6940c507af909914b49f568de74fa965fb", size = 1255106, upload-time = "2025-11-30T12:48:18.454Z" },
 ]
 
 [[package]]
@@ -398,6 +385,55 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e5/81/df4fbe24dff8ba3934af99044188e20a98ed441ad17a274539b74e82e126/einops-0.8.1.tar.gz", hash = "sha256:de5d960a7a761225532e0f1959e5315ebeafc0cd43394732f103ca44b9837e84", size = 54805, upload-time = "2025-02-09T03:17:00.434Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/87/62/9773de14fe6c45c23649e98b83231fffd7b9892b6cf863251dc2afa73643/einops-0.8.1-py3-none-any.whl", hash = "sha256:919387eb55330f5757c6bea9165c5ff5cfe63a642682ea788a6d472576d81737", size = 64359, upload-time = "2025-02-09T03:17:01.998Z" },
+]
+
+[[package]]
+name = "fatterbox"
+version = "1.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "conformer" },
+    { name = "diffusers" },
+    { name = "flask" },
+    { name = "librosa" },
+    { name = "numpy" },
+    { name = "pkuseg" },
+    { name = "pykakasi" },
+    { name = "pyrubberband" },
+    { name = "pysbd" },
+    { name = "resemble-perth" },
+    { name = "s3tokenizer" },
+    { name = "safetensors" },
+    { name = "setuptools" },
+    { name = "torch" },
+    { name = "torchaudio" },
+    { name = "torchcodec" },
+    { name = "transformers" },
+    { name = "tts-webui-chatterbox-tts" },
+    { name = "wyoming" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "conformer", specifier = "==0.3.2" },
+    { name = "diffusers", specifier = "==0.29.0" },
+    { name = "flask" },
+    { name = "librosa", specifier = "==0.11.0" },
+    { name = "numpy" },
+    { name = "pkuseg" },
+    { name = "pykakasi", specifier = "==2.3.0" },
+    { name = "pyrubberband", specifier = ">=0.4.0" },
+    { name = "pysbd" },
+    { name = "resemble-perth", specifier = "==1.0.1" },
+    { name = "s3tokenizer" },
+    { name = "safetensors" },
+    { name = "setuptools", specifier = ">=80.9.0" },
+    { name = "torch", specifier = ">=2.7.1" },
+    { name = "torchaudio", specifier = ">=2.7.1" },
+    { name = "torchcodec", specifier = ">=0.8.1" },
+    { name = "transformers", specifier = "==4.46.3" },
+    { name = "tts-webui-chatterbox-tts", git = "https://github.com/rsxdalv/chatterbox.git?rev=faster" },
+    { name = "wyoming", specifier = ">=1.8.0" },
 ]
 
 [[package]]
@@ -1189,6 +1225,16 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/57/ca/5a9d38900d9d74785141d6580950fe705de68af735ff6e727cb911b64740/pillow-12.0.0-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bdee52571a343d721fb2eb3b090a82d959ff37fc631e3f70422e0c2e029f3e76", size = 5963654, upload-time = "2025-10-15T18:24:09.579Z" },
     { url = "https://files.pythonhosted.org/packages/95/7e/f896623c3c635a90537ac093c6a618ebe1a90d87206e42309cb5d98a1b9e/pillow-12.0.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:b290fd8aa38422444d4b50d579de197557f182ef1068b75f5aa8558638b8d0a5", size = 6997850, upload-time = "2025-10-15T18:24:11.495Z" },
 ]
+
+[[package]]
+name = "pkuseg"
+version = "0.0.25"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cython" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/64/3a/090a533c7f0682d653633cfd2d33e9aab3e671379fb199aeb7fa9bd3c34a/pkuseg-0.0.25.tar.gz", hash = "sha256:dd012bf93689721c9574bc2b2ba98fb4ac22790cec0af354a78e217828b81e91", size = 48751866, upload-time = "2020-06-19T06:55:31.14Z" }
 
 [[package]]
 name = "platformdirs"
