@@ -23,6 +23,7 @@ dependencies = [
   "torchcodec>=0.8.1",
   "wyoming>=1.8.0",
   "pyrubberband>=0.4.0",
+  "pydub"
 ]
 
 [tool.uv.extra-build-dependencies]

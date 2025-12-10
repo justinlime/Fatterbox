@@ -1,13 +1,15 @@
 """
 Chatterbox TTS Server
-OpenAI-compatible API + Wyoming Protocol support
+OpenAI-compatible API + Wyoming Protocol support with Multi-Voice Support
 """
 import argparse
 import gc
 import io
 import logging
 import os
+import time
 from functools import partial
+from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +18,8 @@ import asyncio
 import pysbd
 import torch
 import torchaudio
+import numpy as np
+from pydub import AudioSegment
 from flask import Flask, Response, jsonify, render_template, request, send_file
 
 from chatterbox.tts import ChatterboxTTS
@@ -26,6 +30,115 @@ from wyoming.server import AsyncServer, AsyncEventHandler
 from wyoming.tts import Synthesize, SynthesizeStart, SynthesizeChunk, SynthesizeStop, SynthesizeStopped
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
+
+
+# ============================================================================
+# Voice Management
+# ============================================================================
+
+class VoiceLoader:
+    """Loads and manages multiple voice prompts from directory with runtime discovery"""
+    
+    SUPPORTED_AUDIO_FORMATS = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.opus'}
+    OPENAI_VOICE_NAMES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+    
+    def __init__(self, voices_dir: str, default_voice: Optional[str] = None):
+        self.voices_dir = Path(voices_dir)
+        self.voices: Dict[str, str] = {}
+        self.default_voice_name = default_voice
+        self.last_scan_time = 0
+        self.scan_lock = Lock()
+        
+        # Initial scan
+        if not self.voices_dir.exists():
+            raise ValueError(f"Voices directory does not exist: {voices_dir}")
+        if not self.voices_dir.is_dir():
+            raise ValueError(f"Voices path is not a directory: {voices_dir}")
+        
+        self._scan_voices_directory()
+        
+        if not self.voices:
+            raise ValueError(f"No audio files found in voices directory: {voices_dir}")
+        
+        # Set default voice
+        if self.default_voice_name:
+            if self.default_voice_name not in self.voices:
+                logging.warning(f"Default voice '{self.default_voice_name}' not found, using first available")
+                self.default_voice_name = list(self.voices.keys())[0]
+        else:
+            self.default_voice_name = list(self.voices.keys())[0]
+        
+        logging.info(f"Default voice set to: {self.default_voice_name}")
+        logging.info(f"OpenAI-compatible voice names mapped to: {self.default_voice_name}")
+    
+    def _scan_voices_directory(self):
+        """Scan directory and load all audio files as voices"""
+        with self.scan_lock:
+            voices_before = set(self.voices.keys())
+            
+            # Scan for audio files
+            audio_files = []
+            for ext in self.SUPPORTED_AUDIO_FORMATS:
+                audio_files.extend(self.voices_dir.glob(f"*{ext}"))
+                audio_files.extend(self.voices_dir.glob(f"*{ext.upper()}"))
+            
+            # Update voices dictionary
+            new_voices = {}
+            for audio_file in sorted(audio_files):
+                voice_name = audio_file.stem
+                new_voices[voice_name] = str(audio_file.absolute())
+            
+            # Detect changes
+            voices_after = set(new_voices.keys())
+            added = voices_after - voices_before
+            removed = voices_before - voices_after
+            
+            if added:
+                logging.info(f"Added voices: {sorted(added)}")
+            if removed:
+                logging.info(f"Removed voices: {sorted(removed)}")
+            
+            self.voices = new_voices
+            self.last_scan_time = time.time()
+            
+            if not voices_before and self.voices:
+                # Initial scan
+                logging.info(f"Loaded {len(self.voices)} voices: {sorted(self.voices.keys())}")
+    
+    def refresh_voices(self):
+        """Force a rescan of the voices directory"""
+        logging.info("Refreshing voices directory...")
+        self._scan_voices_directory()
+    
+    def get_voice_path(self, voice_name: str, auto_refresh: bool = True) -> Optional[str]:
+        """Get audio prompt path for a voice name, with optional auto-refresh"""
+        # Check if it's an OpenAI voice name
+        if voice_name in self.OPENAI_VOICE_NAMES:
+            voice_name = self.default_voice_name
+        
+        # Try to find the voice
+        voice_path = self.voices.get(voice_name)
+        
+        # If not found and auto_refresh enabled, rescan and try again
+        if voice_path is None and auto_refresh:
+            logging.info(f"Voice '{voice_name}' not found, rescanning directory...")
+            self._scan_voices_directory()
+            voice_path = self.voices.get(voice_name)
+        
+        return voice_path
+    
+    def get_default_voice_path(self) -> str:
+        """Get default voice audio prompt path"""
+        return self.voices[self.default_voice_name]
+    
+    def list_voices(self) -> List[str]:
+        """Get list of all available voice names"""
+        return sorted(self.voices.keys())
+    
+    def get_all_voices_with_openai(self) -> List[str]:
+        """Get all voices including OpenAI-compatible names"""
+        actual_voices = self.list_voices()
+        return sorted(set(actual_voices + self.OPENAI_VOICE_NAMES))
 
 
 # ============================================================================
@@ -42,7 +155,12 @@ class Config:
         self.device = self._validate_device(args.device)
         self.stream = args.stream
         self.language_id = args.language_id or "en"
-        self.audio_prompt = args.audio_prompt
+        
+        # Voice management
+        self.voice_loader = VoiceLoader(
+            voices_dir=args.voices_dir,
+            default_voice=args.default_voice
+        )
         
         # Generation parameters
         self.exaggeration = args.exaggeration
@@ -58,16 +176,6 @@ class Config:
             "generate_token_backend": "cudagraphs-manual",
             "stride_length": 4,
             "skip_when_1": True,
-        }
-        
-        # Voice mapping
-        self.voice_map = {
-            "alloy": self.audio_prompt,
-            "echo": self.audio_prompt,
-            "fable": self.audio_prompt,
-            "onyx": self.audio_prompt,
-            "nova": self.audio_prompt,
-            "shimmer": self.audio_prompt,
         }
     
     @staticmethod
@@ -176,7 +284,7 @@ class ModelManager:
             logging.debug("Using cached conditionals")
             self.model.conds = voice_conds
         else:
-            logging.info("Generating new conditionals")
+            logging.info(f"Generating new conditionals for: {Path(audio_prompt_path).name}")
             self.model.prepare_conditionals(audio_prompt_path)
             self.cached_conds[audio_prompt_path] = self.model.conds
         
@@ -236,26 +344,59 @@ class AudioProcessor:
         return waveform_int16.numpy().tobytes()
     
     def save_audio(self, waveform: torch.Tensor, format: str) -> io.BytesIO:
-        """Save audio to buffer in specified format"""
+        """
+        Save audio waveform to a BytesIO buffer in the requested format.
+        Uses raw PCM16 for 'pcm', pydub (ffmpeg) for everything else.
+        """
+
         buffer = io.BytesIO()
-        
-        if format == 'pcm':
-            buffer.write(self.to_pcm16(waveform))
+
+        # Normalize tensor: [-1, 1] → int16 numpy
+        waveform = waveform.cpu().numpy()
+        if waveform.ndim == 1:
+            waveform = waveform[np.newaxis, :]
+
+        int16_audio = (waveform * 32767).astype(np.int16).squeeze()
+
+        # --- RAW PCM (streaming format) ---
+        if format == "pcm":
+            buffer.write(int16_audio.tobytes())
+            buffer.seek(0)
+            return buffer
+
+        # --- Convert tensor → pydub AudioSegment ---
+        # AudioSegment expects raw PCM bytes
+        segment = AudioSegment(
+            int16_audio.tobytes(),
+            frame_rate=self.sample_rate,
+            sample_width=2,
+            channels=1,
+        )
+
+        # --- Format normalization ---
+        export_format = format
+        codec_params = {}
+
+        # Opus must be inside an OGG container
+        if format == "opus":
+            export_format = "ogg"
+            codec_params["codec"] = "libopus"
+
+        # AAC should be inside an M4A container
+        elif format == "aac":
+            export_format = "mp4"
+            codec_params["codec"] = "aac"
+
+        # FLAC/WAV/MP3 can export normally
+        elif format in ("mp3", "wav", "flac"):
+            pass
         else:
-            waveform_2d = waveform.unsqueeze(0)
-            format_args = {"format": format}
-            
-            if format == 'opus':
-                format_args = {"format": "ogg", "encoding": "opus"}
-            elif format == 'aac':
-                format_args = {"format": "mp4", "encoding": "aac"}
-            
-            torchaudio.save(buffer, waveform_2d, self.sample_rate, **format_args)
-        
+            raise ValueError(f"Unsupported output format: {format}")
+
+        # --- Export through pydub/ffmpeg ---
+        segment.export(buffer, format=export_format, **codec_params)
         buffer.seek(0)
         return buffer
-
-
 # ============================================================================
 # Flask API Server
 # ============================================================================
@@ -275,6 +416,8 @@ class FlaskServer:
         """Register Flask routes"""
         self.app.route("/v1/audio/speech", methods=["POST"])(self.openai_tts)
         self.app.route("/v1/models", methods=["GET"])(self.list_models)
+        self.app.route("/v1/voices", methods=["GET"])(self.list_voices)
+        self.app.route("/v1/voices/refresh", methods=["POST"])(self.refresh_voices)
     
     def openai_tts(self):
         """OpenAI-compatible TTS endpoint"""
@@ -282,7 +425,7 @@ class FlaskServer:
         
         # Extract parameters
         text = payload.get("input", "")
-        voice = payload.get("voice", "alloy")
+        voice = payload.get("voice", self.config.voice_loader.default_voice_name)
         cfg_weight = payload.get("speed", 1.0)
         stream = payload.get("stream", self.config.stream)
         fmt = payload.get("response_format", "mp3" if not stream else "pcm").lower()
@@ -290,10 +433,15 @@ class FlaskServer:
         if not text:
             return jsonify({"error": "Missing input in request"}), 400
         
-        # Get audio prompt
-        audio_prompt_path = self.config.voice_map.get(voice, self.config.audio_prompt)
+        # Get audio prompt (will auto-refresh if voice not found)
+        audio_prompt_path = self.config.voice_loader.get_voice_path(voice, auto_refresh=True)
         if not audio_prompt_path:
-            return jsonify({"error": f"Voice '{voice}' not configured"}), 400
+            available_voices = self.config.voice_loader.get_all_voices_with_openai()
+            return jsonify({
+                "error": f"Voice '{voice}' not found",
+                "available_voices": available_voices,
+                "hint": "Try refreshing with POST /v1/voices/refresh"
+            }), 400
         
         # Prepare model
         self.model_manager.prepare_voice_conditionals(audio_prompt_path)
@@ -372,6 +520,31 @@ class FlaskServer:
             ]
         })
     
+    def list_voices(self):
+        """List available voices"""
+        actual_voices = self.config.voice_loader.list_voices()
+        all_voices = self.config.voice_loader.get_all_voices_with_openai()
+        default_voice = self.config.voice_loader.default_voice_name
+        
+        return jsonify({
+            "voices": all_voices,
+            "actual_voices": actual_voices,
+            "openai_voices": VoiceLoader.OPENAI_VOICE_NAMES,
+            "default_voice": default_voice,
+            "openai_mapping": f"OpenAI voices (alloy, echo, etc.) map to '{default_voice}'",
+            "count": len(actual_voices)
+        })
+    
+    def refresh_voices(self):
+        """Manually refresh voices from directory"""
+        self.config.voice_loader.refresh_voices()
+        return jsonify({
+            "status": "success",
+            "message": "Voices refreshed",
+            "voices": self.config.voice_loader.list_voices(),
+            "count": len(self.config.voice_loader.list_voices())
+        })
+    
     def run(self):
         """Run Flask server"""
         self.app.run(
@@ -415,13 +588,15 @@ class WyomingEventHandler(AsyncEventHandler):
         """Handle incoming Wyoming protocol events"""
         if event.type == "describe":
             logging.info("Received describe event")
-            await self.write_event(self.wyoming_info.event())
+            # Refresh Wyoming info to include any newly added voices
+            updated_info = self._get_updated_wyoming_info()
+            await self.write_event(updated_info.event())
             return True
         
         # Streaming protocol
         if SynthesizeStart.is_type(event.type):
             synth_start = SynthesizeStart.from_event(event)
-            self.streaming_voice = synth_start.voice.name if synth_start.voice else "alloy"
+            self.streaming_voice = synth_start.voice.name if synth_start.voice else self.config.voice_loader.default_voice_name
             self.streaming_text_buffer = []
             self.is_streaming = True
             logging.info(f"Wyoming TTS streaming started with voice '{self.streaming_voice}'")
@@ -436,7 +611,7 @@ class WyomingEventHandler(AsyncEventHandler):
         if SynthesizeStop.is_type(event.type):
             logging.info("Wyoming TTS streaming stopped")
             full_text = "".join(self.streaming_text_buffer)
-            await self._generate_and_stream_audio(full_text, self.streaming_voice or "alloy")
+            await self._generate_and_stream_audio(full_text, self.streaming_voice or self.config.voice_loader.default_voice_name)
             await self.write_event(SynthesizeStopped().event())
             
             self.streaming_text_buffer = []
@@ -451,7 +626,7 @@ class WyomingEventHandler(AsyncEventHandler):
                 return True
             
             synthesize = Synthesize.from_event(event)
-            voice_name = synthesize.voice.name if synthesize.voice else "alloy"
+            voice_name = synthesize.voice.name if synthesize.voice else self.config.voice_loader.default_voice_name
             logging.info(f"Wyoming TTS request (legacy): '{synthesize.text}' with voice '{voice_name}'")
             await self._generate_and_stream_audio(synthesize.text, voice_name)
             return True
@@ -459,15 +634,42 @@ class WyomingEventHandler(AsyncEventHandler):
         logging.warning(f"Unexpected event type: {event.type}")
         return True
     
+    def _get_updated_wyoming_info(self) -> Info:
+        """Get updated Wyoming info with current voices"""
+        return Info(
+            tts=[TtsProgram(
+                name="chatterbox",
+                version="1.0.0",
+                description="Chatterbox TTS with voice cloning",
+                attribution=Attribution(
+                    name="Chatterbox",
+                    url="https://github.com/chatterbox-tts/chatterbox"
+                ),
+                installed=True,
+                supports_synthesize_streaming=True,
+                voices=[
+                    TtsVoice(
+                        name=voice_name,
+                        version="1.0.0",
+                        description=f"Chatterbox voice: {voice_name}",
+                        attribution=Attribution(name="Chatterbox", url=""),
+                        installed=True,
+                        languages=[self.config.language_id]
+                    )
+                    for voice_name in self.config.voice_loader.list_voices()
+                ]
+            )]
+        )
+    
     async def _generate_and_stream_audio(self, text: str, voice_name: str):
         """Generate audio with parallel prefetching and stream via Wyoming protocol"""
         loop = asyncio.get_event_loop()
         
-        # Get voice audio prompt
-        audio_prompt_path = self.config.voice_map.get(voice_name, self.config.audio_prompt)
+        # Get voice audio prompt (will auto-refresh if not found)
+        audio_prompt_path = self.config.voice_loader.get_voice_path(voice_name, auto_refresh=True)
         if not audio_prompt_path:
-            logging.error("No audio prompt configured")
-            return
+            logging.error(f"Voice '{voice_name}' not found even after refresh, using default")
+            audio_prompt_path = self.config.voice_loader.get_default_voice_path()
         
         # Prepare voice conditionals in executor to not block
         await loop.run_in_executor(
@@ -589,7 +791,7 @@ class WyomingServer:
                         installed=True,
                         languages=[self.config.language_id]
                     )
-                    for voice_name in self.config.voice_map.keys()
+                    for voice_name in self.config.voice_loader.list_voices()
                 ]
             )]
         )
@@ -612,7 +814,7 @@ class WyomingServer:
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="OpenAI-compatible TTS server for Chatterbox with Wyoming protocol support."
+        description="OpenAI-compatible TTS server for Chatterbox with Wyoming protocol support and multi-voice support."
     )
     
     # Server arguments
@@ -624,7 +826,12 @@ def parse_args():
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
                        default=os.getenv("STREAM", "").lower() == "true")
     parser.add_argument("--language-id", type=str, default=os.getenv("LANGUAGE_ID", "en"))
-    parser.add_argument("--audio-prompt", type=str, default=os.getenv("AUDIO_PROMPT"))
+    
+    # Voice configuration
+    parser.add_argument("--voices-dir", type=str, default=os.getenv("VOICES_DIR"),
+                       help="Directory containing voice audio files (wav, mp3, flac, etc.)")
+    parser.add_argument("--default-voice", type=str, default=os.getenv("DEFAULT_VOICE"),
+                       help="Default voice name for OpenAI-compatible voice names (alloy, echo, etc.)")
     
     # Generation arguments
     parser.add_argument("--exaggeration", type=float, default=float(os.getenv("EXAGGERATION", "0.5")))
