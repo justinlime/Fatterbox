@@ -48,6 +48,8 @@ class VoiceLoader:
         self.default_voice_name = default_voice
         self.last_scan_time = 0
         self.scan_lock = Lock()
+        self.polling_thread = None
+        self.should_poll = False
         
         # Initial scan
         if not self.voices_dir.exists():
@@ -105,27 +107,39 @@ class VoiceLoader:
                 # Initial scan
                 logging.info(f"Loaded {len(self.voices)} voices: {sorted(self.voices.keys())}")
     
-    def refresh_voices(self):
-        """Force a rescan of the voices directory"""
-        logging.info("Refreshing voices directory...")
-        self._scan_voices_directory()
+    def _polling_loop(self):
+        """Background thread that polls the directory for changes every 1 second"""
+        logging.info("Voice polling started (interval: 1.0s)")
+        while self.should_poll:
+            time.sleep(1.0)
+            if self.should_poll:  # Check again after sleep
+                try:
+                    self._scan_voices_directory()
+                except Exception as e:
+                    logging.error(f"Error during voice directory polling: {e}")
     
-    def get_voice_path(self, voice_name: str, auto_refresh: bool = True) -> Optional[str]:
-        """Get audio prompt path for a voice name, with optional auto-refresh"""
+    def start_polling(self):
+        """Start the background polling thread"""
+        if self.polling_thread is None or not self.polling_thread.is_alive():
+            self.should_poll = True
+            self.polling_thread = Thread(target=self._polling_loop, daemon=True)
+            self.polling_thread.start()
+            logging.info("Voice directory polling enabled")
+    
+    def stop_polling(self):
+        """Stop the background polling thread"""
+        self.should_poll = False
+        if self.polling_thread is not None:
+            self.polling_thread.join(timeout=2.0)
+            logging.info("Voice directory polling stopped")
+    
+    def get_voice_path(self, voice_name: str) -> Optional[str]:
+        """Get audio prompt path for a voice name"""
         # Check if it's an OpenAI voice name
         if voice_name in self.OPENAI_VOICE_NAMES:
             voice_name = self.default_voice_name
         
-        # Try to find the voice
-        voice_path = self.voices.get(voice_name)
-        
-        # If not found and auto_refresh enabled, rescan and try again
-        if voice_path is None and auto_refresh:
-            logging.info(f"Voice '{voice_name}' not found, rescanning directory...")
-            self._scan_voices_directory()
-            voice_path = self.voices.get(voice_name)
-        
-        return voice_path
+        return self.voices.get(voice_name)
     
     def get_default_voice_path(self) -> str:
         """Get default voice audio prompt path"""
@@ -156,7 +170,7 @@ class Config:
         self.stream = args.stream
         self.language_id = args.language_id or "en"
         
-        # Voice management
+        # Voice management with polling
         self.voice_loader = VoiceLoader(
             voices_dir=args.voices_dir,
             default_voice=args.default_voice
@@ -165,17 +179,21 @@ class Config:
         # Generation parameters
         self.exaggeration = args.exaggeration
         self.temperature = args.temperature
+        self.cfg_weight = args.cfg_weight
         self.min_p = args.min_p
         self.top_p = args.top_p
         self.repetition_penalty = args.repetition_penalty
         self.dtype = args.dtype
         
         # T3 optimization params
+        # FIXED: Disabled skip_when_1 to prevent CUDA graph capture errors
+        # The skip_when_1 optimization causes "operation not permitted when stream is capturing"
+        # errors because it tries to compare top_p tensor during graph capture
         self.t3_params = {
             "initial_forward_pass_backend": "eager",
             "generate_token_backend": "cudagraphs-manual",
             "stride_length": 4,
-            "skip_when_1": True,
+            "skip_when_1": False,  # Changed from True to prevent graph capture errors
         }
     
     @staticmethod
@@ -397,6 +415,8 @@ class AudioProcessor:
         segment.export(buffer, format=export_format, **codec_params)
         buffer.seek(0)
         return buffer
+
+
 # ============================================================================
 # Flask API Server
 # ============================================================================
@@ -417,7 +437,9 @@ class FlaskServer:
         self.app.route("/v1/audio/speech", methods=["POST"])(self.openai_tts)
         self.app.route("/v1/models", methods=["GET"])(self.list_models)
         self.app.route("/v1/voices", methods=["GET"])(self.list_voices)
-        self.app.route("/v1/voices/refresh", methods=["POST"])(self.refresh_voices)
+        # OpenWebUI compat
+        self.app.route("/v1/audio/models", methods=["GET"])(self.list_models)
+        self.app.route("/v1/audio/voices", methods=["GET"])(self.list_voices)
     
     def openai_tts(self):
         """OpenAI-compatible TTS endpoint"""
@@ -426,21 +448,22 @@ class FlaskServer:
         # Extract parameters
         text = payload.get("input", "")
         voice = payload.get("voice", self.config.voice_loader.default_voice_name)
-        cfg_weight = payload.get("speed", 1.0)
+        # OpenAI uses "speed" parameter, but we map it to cfg_weight
+        # If "speed" is provided, use it; otherwise use default cfg_weight
+        cfg_weight = payload.get("speed", self.config.cfg_weight)
         stream = payload.get("stream", self.config.stream)
-        fmt = payload.get("response_format", "mp3" if not stream else "pcm").lower()
+        fmt = payload.get("response_format", "pcm").lower()
         
         if not text:
             return jsonify({"error": "Missing input in request"}), 400
         
-        # Get audio prompt (will auto-refresh if voice not found)
-        audio_prompt_path = self.config.voice_loader.get_voice_path(voice, auto_refresh=True)
+        # Get audio prompt (polling handles discovery automatically)
+        audio_prompt_path = self.config.voice_loader.get_voice_path(voice)
         if not audio_prompt_path:
             available_voices = self.config.voice_loader.get_all_voices_with_openai()
             return jsonify({
                 "error": f"Voice '{voice}' not found",
-                "available_voices": available_voices,
-                "hint": "Try refreshing with POST /v1/voices/refresh"
+                "available_voices": available_voices
             }), 400
         
         # Prepare model
@@ -533,16 +556,6 @@ class FlaskServer:
             "default_voice": default_voice,
             "openai_mapping": f"OpenAI voices (alloy, echo, etc.) map to '{default_voice}'",
             "count": len(actual_voices)
-        })
-    
-    def refresh_voices(self):
-        """Manually refresh voices from directory"""
-        self.config.voice_loader.refresh_voices()
-        return jsonify({
-            "status": "success",
-            "message": "Voices refreshed",
-            "voices": self.config.voice_loader.list_voices(),
-            "count": len(self.config.voice_loader.list_voices())
         })
     
     def run(self):
@@ -665,10 +678,10 @@ class WyomingEventHandler(AsyncEventHandler):
         """Generate audio with parallel prefetching and stream via Wyoming protocol"""
         loop = asyncio.get_event_loop()
         
-        # Get voice audio prompt (will auto-refresh if not found)
-        audio_prompt_path = self.config.voice_loader.get_voice_path(voice_name, auto_refresh=True)
+        # Get voice audio prompt (polling handles discovery automatically)
+        audio_prompt_path = self.config.voice_loader.get_voice_path(voice_name)
         if not audio_prompt_path:
-            logging.error(f"Voice '{voice_name}' not found even after refresh, using default")
+            logging.error(f"Voice '{voice_name}' not found, using default")
             audio_prompt_path = self.config.voice_loader.get_default_voice_path()
         
         # Prepare voice conditionals in executor to not block
@@ -676,19 +689,19 @@ class WyomingEventHandler(AsyncEventHandler):
             self.executor, self.model_manager.prepare_voice_conditionals, audio_prompt_path
         )
         
-        # Generation kwargs - MUST match OpenAI endpoint exactly
+        # Generation kwargs - uses default cfg_weight from config
         kwargs = {
             "language_id": self.config.language_id,
             "exaggeration": self.config.exaggeration,
             "temperature": self.config.temperature,
-            "cfg_weight": 1.0,  # Match OpenAI default
+            "cfg_weight": self.config.cfg_weight,
             "min_p": self.config.min_p,
             "top_p": self.config.top_p,
             "repetition_penalty": self.config.repetition_penalty,
             "t3_params": self.config.t3_params,
         }
         
-        logging.info(f"Wyoming request: text='{text[:50]}...', voice='{voice_name}', cfg_weight=1.0")
+        logging.info(f"Wyoming request: text='{text[:50]}...', voice='{voice_name}', cfg_weight={self.config.cfg_weight}")
         
         # Send audio start
         await self.write_event(AudioStart(
@@ -836,6 +849,8 @@ def parse_args():
     # Generation arguments
     parser.add_argument("--exaggeration", type=float, default=float(os.getenv("EXAGGERATION", "0.5")))
     parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE", "0.8")))
+    parser.add_argument("--cfg-weight", type=float, default=float(os.getenv("CFG_WEIGHT", "1.0")),
+                       help="Classifier-free guidance weight (default: 1.0)")
     parser.add_argument("--min-p", type=float, default=float(os.getenv("MIN_P", "0.05")))
     parser.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P", "1.0")))
     parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("REPETITION_PENALTY", "1.2")))
@@ -864,9 +879,12 @@ def main():
     model_manager = ModelManager(config)
     audio_processor = AudioProcessor()
     
+    # Start voice directory polling
+    config.voice_loader.start_polling()
+    
     # Start Flask server in background thread
-    flask_server = FlaskServer(model_manager, audio_processor, config)
-    flask_thread = Thread(target=flask_server.run, daemon=True)
+    openapi_server = FlaskServer(model_manager, audio_processor, config)
+    flask_thread = Thread(target=openapi_server.run, daemon=True)
     flask_thread.start()
     
     logging.info(f"Flask server started on {config.host}:{config.openai_port}")
@@ -878,6 +896,7 @@ def main():
         asyncio.run(wyoming_server.run())
     except KeyboardInterrupt:
         logging.info("Shutting down servers...")
+        config.voice_loader.stop_polling()
 
 
 if __name__ == "__main__":

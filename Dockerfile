@@ -33,15 +33,13 @@ RUN pip install --no-cache-dir uv && \
     uv venv --python /usr/local/bin/python && \
     uv sync --locked --no-editable
 
-# Copy application code
-COPY main.py docker_init.py ./
+COPY docker_init.py ./
 
 # Run initialization script to download all models (CPU mode - no CUDA needed)
 # Models are downloaded on CPU but will be loaded on GPU at runtime if available
 RUN /chatter/.venv/bin/python docker_init.py
 
-# Verify cache directories have content
-RUN du -sh /chatter/.cache/* 2>/dev/null || echo "Cache directories created"
+COPY src/ ./
 
 # Set environment variable to disable online lookups at runtime
 ENV HF_HUB_OFFLINE=1
