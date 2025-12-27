@@ -1,0 +1,14 @@
+[project]
+name = "fatterbox"
+version = "1.0.0"
+description = "fatterbox"
+requires-python = "==3.11.*"
+dependencies = [
+    "wyoming",
+    "onnxruntime-gpu",
+    "transformers",
+    "huggingface-hub",
+    "numpy",
+    "librosa",
+    "soundfile",
+]
