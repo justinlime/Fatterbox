@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Wyoming Protocol wrapper for Chatterbox Turbo TTS
+Wyoming Protocol wrapper for Chatterbox TTS
 Provides voice cloning with automatic voice discovery from a directory.
 """
 import argparse
@@ -19,13 +19,13 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import async_write_event
 from wyoming.info import Describe
 
-from chatterbox.tts_turbo import ChatterboxTurboTTS
+from chatterbox.tts import ChatterboxTTS
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class ChatterboxTurboEventHandler(AsyncEventHandler):
-    """Wyoming event handler for Chatterbox Turbo TTS."""
+class ChatterboxEventHandler(AsyncEventHandler):
+    """Wyoming event handler for Chatterbox TTS."""
     
     def __init__(self, wyoming_info: Info, model, voices: dict, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -63,8 +63,7 @@ class ChatterboxTurboEventHandler(AsyncEventHandler):
         if voice_name and not audio_prompt_path:
             _LOGGER.warning(f"Voice '{voice_name}' not found, using default")
         
-        # Since Chatterbox Turbo doesn't support true streaming, we chunk the input
-        # Split on sentence boundaries for more natural breaks
+        # Split on sentence boundaries for more natural streaming
         chunks = self._split_text(text)
         
         # Send audio start event
@@ -108,7 +107,7 @@ class ChatterboxTurboEventHandler(AsyncEventHandler):
         _LOGGER.info(f"[Client {self.client_id}] Synthesis complete")
     
     def _generate_audio(self, text: str, audio_prompt_path: str = None) -> torch.Tensor:
-        """Generate audio using Chatterbox Turbo (synchronous)."""
+        """Generate audio using Chatterbox (synchronous)."""
         # Generate with or without voice cloning
         if audio_prompt_path:
             wav = self.model.generate(text, audio_prompt_path=audio_prompt_path)
@@ -118,7 +117,7 @@ class ChatterboxTurboEventHandler(AsyncEventHandler):
             if default_voice:
                 wav = self.model.generate(text, audio_prompt_path=default_voice)
             else:
-                # Fallback: generate without voice cloning (if model supports it)
+                # Fallback: generate without voice cloning
                 wav = self.model.generate(text)
         
         return wav.squeeze()  # Remove batch dimension
@@ -170,9 +169,9 @@ def load_voices(voices_dir: Path) -> dict:
 
 
 @lru_cache(maxsize=1)
-def load_model(device: str = "cuda"):
-    """Load Chatterbox Turbo model (cached)."""
-    _LOGGER.info(f"Loading Chatterbox Turbo model on {device}...")
+def load_model(device: str = "cuda", dtype: str = "float32"):
+    """Load Chatterbox TTS model (cached)."""
+    _LOGGER.info(f"Loading Chatterbox TTS model on {device} with dtype {dtype}...")
     
     # Patch watermarker if perth module is not available or broken
     try:
@@ -197,19 +196,48 @@ def load_model(device: str = "cuda"):
             sys.modules['perth'] = types.ModuleType('perth')
         sys.modules['perth'].PerthImplicitWatermarker = lambda: DummyWatermarker()
     
-    model = ChatterboxTurboTTS.from_pretrained(device=device)
+    # Load model
+    model = ChatterboxTTS.from_pretrained(device=device)
+    
+    # Convert to specified dtype if not float32
+    if dtype.lower() not in ["float32", "fp32"]:
+        dtype_map = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        torch_dtype = dtype_map.get(dtype.lower())
+        
+        if torch_dtype:
+            _LOGGER.info(f"Converting model to {torch_dtype}...")
+            # Use the recommended t3_to pattern from Chatterbox docs
+            model.t3.to(dtype=torch_dtype)
+            model.conds.t3.to(dtype=torch_dtype)
+            torch.cuda.empty_cache()
+            _LOGGER.info(f"Model converted to {torch_dtype}")
+    
+    # Warmup for cudagraphs (recommended by Chatterbox docs)
+    if device == "cuda":
+        _LOGGER.info("Warming up model with cudagraphs...")
+        model.generate("Warmup for cudagraphs optimization.")
+        _LOGGER.info("Warmup complete")
+    
     _LOGGER.info("Model loaded successfully")
     return model
 
 
 async def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Wyoming Chatterbox Turbo TTS Server")
+    parser = argparse.ArgumentParser(description="Wyoming Chatterbox TTS Server")
     parser.add_argument("--uri", default="tcp://0.0.0.0:10200", help="Server URI")
     parser.add_argument("--voices-dir", type=Path, default=Path("./voices"), 
                        help="Directory containing voice reference .wav files")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
                        help="Device to run model on")
+    parser.add_argument("--dtype", default="float32",
+                       choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+                       help="Model precision (bf16 recommended for RTX 30xx/40xx)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
@@ -218,7 +246,7 @@ async def main():
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     
     # Load model
-    model = load_model(args.device)
+    model = load_model(args.device, args.dtype)
     
     # Create voices directory if it doesn't exist
     args.voices_dir.mkdir(parents=True, exist_ok=True)
@@ -236,7 +264,7 @@ async def main():
     # Run server with handler factory
     await server.run(
         partial(
-            ChatterboxTurboEventHandler,
+            ChatterboxEventHandler,
             wyoming_info,
             model,
             voices
@@ -257,26 +285,26 @@ def create_info(voices_dir: Path, sample_rate: int) -> Info:
                     name=voice_name,
                     description=f"Cloned voice from {wav_file.name}",
                     attribution=Attribution(
-                        name="Chatterbox Turbo",
+                        name="Chatterbox",
                         url="https://github.com/resemble-ai/chatterbox"
                     ),
                     installed=True,
-                    version="1.0",  # Required by Wyoming protocol
-                    languages=["en"],  # Adjust based on your needs
+                    version="1.0",
+                    languages=["en"],
                 )
             )
     
     return Info(
         tts=[
             TtsProgram(
-                name="chatterbox-turbo",
-                description="Chatterbox Turbo TTS with voice cloning",
+                name="chatterbox",
+                description="Chatterbox TTS with voice cloning",
                 attribution=Attribution(
                     name="Resemble AI",
                     url="https://github.com/resemble-ai/chatterbox"
                 ),
                 installed=True,
-                version="1.0",  # Required by Wyoming protocol
+                version="1.0",
                 voices=voices,
             )
         ]

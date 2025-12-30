@@ -5,7 +5,7 @@ description = "fatterbox"
 requires-python = "==3.11.*"
 dependencies = [
     # EXPORT HF_TOKEN="none"
-    "chatterbox-tts",
+    "tts-webui-chatterbox-tts @ git+https://github.com/rsxdalv/chatterbox.git@faster",
     "wyoming",
     "torch",
     "torchaudio",
