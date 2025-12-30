@@ -4,11 +4,10 @@ version = "1.0.0"
 description = "fatterbox"
 requires-python = "==3.11.*"
 dependencies = [
+    # EXPORT HF_TOKEN="none"
+    "chatterbox-tts",
     "wyoming",
-    "onnxruntime-gpu",
-    "transformers",
-    "huggingface-hub",
-    "numpy",
-    "librosa",
-    "soundfile",
+    "torch",
+    "torchaudio",
+    "perth",
 ]

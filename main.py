@@ -1,471 +1,287 @@
 #!/usr/bin/env python3
 """
-Wyoming Protocol TTS Server for Chatterbox-Turbo
-Home Assistant compatible real-time text-to-speech service
+Wyoming Protocol wrapper for Chatterbox Turbo TTS
+Provides voice cloning with automatic voice discovery from a directory.
 """
 import argparse
 import asyncio
 import logging
-import os
-import sys
-from functools import partial
+import re
 from pathlib import Path
-from typing import Dict, Optional
+from functools import lru_cache, partial
 
-import numpy as np
-import onnxruntime
-import librosa
-import soundfile as sf
-from transformers import AutoTokenizer
-from huggingface_hub import hf_hub_download
-from wyoming.audio import AudioChunk, AudioStart, AudioStop
-from wyoming.event import Event
+import torch
+import torchaudio as ta
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.tts import Synthesize
+from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.event import async_write_event
 from wyoming.info import Describe
 
-# Model constants
-MODEL_ID = "ResembleAI/chatterbox-turbo-ONNX"
-SAMPLE_RATE = 24000
-START_SPEECH_TOKEN = 6561
-STOP_SPEECH_TOKEN = 6562
-SILENCE_TOKEN = 4299
-NUM_KV_HEADS = 16
-HEAD_DIM = 64
+from chatterbox.tts_turbo import ChatterboxTurboTTS
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class RepetitionPenaltyLogitsProcessor:
-    """Apply repetition penalty to prevent model from repeating tokens"""
-    def __init__(self, penalty: float):
-        if not isinstance(penalty, float) or not (penalty > 0):
-            raise ValueError(f"penalty must be positive float, got {penalty}")
-        self.penalty = penalty
-
-    def __call__(self, input_ids: np.ndarray, scores: np.ndarray) -> np.ndarray:
-        score = np.take_along_axis(scores, input_ids, axis=1)
-        score = np.where(score < 0, score * self.penalty, score / self.penalty)
-        scores_processed = scores.copy()
-        np.put_along_axis(scores_processed, input_ids, score, axis=1)
-        return scores_processed
-
-
-class ChatterboxTTS:
-    """Chatterbox-Turbo TTS inference engine"""
+class ChatterboxTurboEventHandler(AsyncEventHandler):
+    """Wyoming event handler for Chatterbox Turbo TTS."""
     
-    def __init__(self, dtype: str = "fp32", voices_dir: str = "./voices", use_cuda: bool = False):
-        self.dtype = dtype
-        self.voices_dir = Path(voices_dir)
-        self.voices: Dict[str, np.ndarray] = {}
-        self.tokenizer = None
-        self.use_cuda = use_cuda
-        
-        # Configure execution providers for ONNX
-        if self.use_cuda:
-            self.providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            _LOGGER.info("CUDA acceleration enabled")
-        else:
-            self.providers = ['CPUExecutionProvider']
-            _LOGGER.info("Using CPU execution")
-        
-        # ONNX sessions
-        self.speech_encoder_session = None
-        self.embed_tokens_session = None
-        self.language_model_session = None
-        self.cond_decoder_session = None
-        
-    def download_model(self, name: str) -> str:
-        """Download ONNX model from HuggingFace"""
-        suffix = "" if self.dtype == "fp32" else "_quantized" if self.dtype == "q8" else f"_{self.dtype}"
-        filename = f"{name}{suffix}.onnx"
-        _LOGGER.info(f"Downloading {filename}...")
-        graph = hf_hub_download(MODEL_ID, subfolder="onnx", filename=filename)
-        hf_hub_download(MODEL_ID, subfolder="onnx", filename=f"{filename}_data")
-        return graph
-    
-    def load_models(self):
-        """Load all ONNX models and tokenizer"""
-        _LOGGER.info("Loading models...")
-        
-        # Download models
-        conditional_decoder_path = self.download_model("conditional_decoder")
-        speech_encoder_path = self.download_model("speech_encoder")
-        embed_tokens_path = self.download_model("embed_tokens")
-        language_model_path = self.download_model("language_model")
-        
-        # Create ONNX sessions
-        _LOGGER.info("Creating ONNX inference sessions...")
-        sess_options = onnxruntime.SessionOptions()
-        sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        self.speech_encoder_session = onnxruntime.InferenceSession(
-            speech_encoder_path, 
-            sess_options=sess_options,
-            providers=self.providers
-        )
-        self.embed_tokens_session = onnxruntime.InferenceSession(
-            embed_tokens_path,
-            sess_options=sess_options,
-            providers=self.providers
-        )
-        self.language_model_session = onnxruntime.InferenceSession(
-            language_model_path,
-            sess_options=sess_options,
-            providers=self.providers
-        )
-        self.cond_decoder_session = onnxruntime.InferenceSession(
-            conditional_decoder_path,
-            sess_options=sess_options,
-            providers=self.providers
-        )
-        
-        # Log which provider is actually being used
-        for name, session in [
-            ("speech_encoder", self.speech_encoder_session),
-            ("embed_tokens", self.embed_tokens_session),
-            ("language_model", self.language_model_session),
-            ("cond_decoder", self.cond_decoder_session)
-        ]:
-            provider = session.get_providers()[0]
-            _LOGGER.debug(f"{name} using: {provider}")
-        
-        # Load tokenizer
-        _LOGGER.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        
-        _LOGGER.info("Models loaded successfully")
-    
-    def load_voices(self):
-        """Load all voice reference audio files from voices directory"""
-        if not self.voices_dir.exists():
-            _LOGGER.warning(f"Voices directory not found: {self.voices_dir}")
-            self.voices_dir.mkdir(parents=True, exist_ok=True)
-            return
-        
-        _LOGGER.info(f"Loading voices from {self.voices_dir}...")
-        audio_extensions = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
-        
-        for audio_file in self.voices_dir.iterdir():
-            if audio_file.suffix.lower() in audio_extensions:
-                try:
-                    # Load audio and resample to model sample rate
-                    audio_values, _ = librosa.load(str(audio_file), sr=SAMPLE_RATE)
-                    audio_values = audio_values[np.newaxis, :].astype(np.float32)
-                    
-                    # Use filename without extension as voice name
-                    voice_name = audio_file.stem
-                    self.voices[voice_name] = audio_values
-                    
-                    _LOGGER.info(f"Loaded voice: {voice_name} ({audio_file.name})")
-                except Exception as e:
-                    _LOGGER.error(f"Failed to load {audio_file.name}: {e}")
-        
-        if not self.voices:
-            _LOGGER.warning("No voices loaded. Add .wav files to voices directory.")
-    
-    def synthesize(
-        self,
-        text: str,
-        voice_name: str,
-        max_new_tokens: int = 1024,
-        repetition_penalty: float = 1.2
-    ) -> np.ndarray:
-        """
-        Synthesize speech from text using specified voice
-        
-        Args:
-            text: Text to synthesize
-            voice_name: Name of voice to use (must exist in self.voices)
-            max_new_tokens: Maximum tokens to generate
-            repetition_penalty: Penalty for repeating tokens
-            
-        Returns:
-            Audio waveform as numpy array
-        """
-        if voice_name not in self.voices:
-            raise ValueError(f"Voice '{voice_name}' not found. Available: {list(self.voices.keys())}")
-        
-        _LOGGER.info(f"Synthesizing with voice '{voice_name}': {text[:50]}...")
-        
-        # Get reference audio for this voice
-        audio_values = self.voices[voice_name]
-        
-        # Tokenize text
-        input_ids = self.tokenizer(text, return_tensors="np")["input_ids"].astype(np.int64)
-        
-        # Generation loop
-        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
-        generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
-        
-        for i in range(max_new_tokens):
-            inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": input_ids})[0]
-            
-            if i == 0:
-                # First iteration: encode reference audio
-                ort_speech_encoder_input = {"audio_values": audio_values}
-                cond_emb, prompt_token, speaker_embeddings, speaker_features = \
-                    self.speech_encoder_session.run(None, ort_speech_encoder_input)
-                inputs_embeds = np.concatenate((cond_emb, inputs_embeds), axis=1)
-                
-                # Initialize cache and LLM inputs
-                batch_size, seq_len, _ = inputs_embeds.shape
-                past_key_values = {
-                    inp.name: np.zeros(
-                        [batch_size, NUM_KV_HEADS, 0, HEAD_DIM],
-                        dtype=np.float16 if inp.type == 'tensor(float16)' else np.float32
-                    )
-                    for inp in self.language_model_session.get_inputs()
-                    if "past_key_values" in inp.name
-                }
-                attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
-                position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1).repeat(batch_size, axis=0)
-            
-            # Run language model
-            logits, *present_key_values = self.language_model_session.run(None, dict(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **past_key_values,
-            ))
-            
-            # Apply repetition penalty and sample next token
-            logits = logits[:, -1, :]
-            next_token_logits = repetition_penalty_processor(generate_tokens, logits)
-            input_ids = np.argmax(next_token_logits, axis=-1, keepdims=True).astype(np.int64)
-            generate_tokens = np.concatenate((generate_tokens, input_ids), axis=-1)
-            
-            # Check for stop token
-            if (input_ids.flatten() == STOP_SPEECH_TOKEN).all():
-                break
-            
-            # Update for next iteration
-            attention_mask = np.concatenate([attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1)
-            position_ids = position_ids[:, -1:] + 1
-            for j, key in enumerate(past_key_values):
-                past_key_values[key] = present_key_values[j]
-        
-        # Decode audio from tokens
-        speech_tokens = generate_tokens[:, 1:-1]
-        silence_tokens = np.full((speech_tokens.shape[0], 3), SILENCE_TOKEN, dtype=np.int64)
-        speech_tokens = np.concatenate([prompt_token, speech_tokens, silence_tokens], axis=1)
-        
-        wav = self.cond_decoder_session.run(None, dict(
-            speech_tokens=speech_tokens,
-            speaker_embeddings=speaker_embeddings,
-            speaker_features=speaker_features,
-        ))[0].squeeze(axis=0)
-        
-        _LOGGER.info(f"Synthesized {len(wav) / SAMPLE_RATE:.2f}s of audio")
-        return wav
-
-
-class ChatterboxEventHandler(AsyncEventHandler):
-    """Handle Wyoming protocol events for TTS"""
-    
-    def __init__(
-        self,
-        tts_engine: ChatterboxTTS,
-        wyoming_info: Info,
-        *args,
-        **kwargs
-    ):
+    def __init__(self, wyoming_info: Info, model, voices: dict, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.tts_engine = tts_engine
+        self.wyoming_info = wyoming_info
         self.wyoming_info_event = wyoming_info.event()
-        self.default_voice = next(iter(tts_engine.voices.keys())) if tts_engine.voices else None
+        self.model = model
+        self.voices = voices
+        self.sample_rate = model.sr  # Use model's native sample rate
+        self.client_id = id(self)
     
-    async def handle_event(self, event: Event) -> bool:
-        """Process incoming Wyoming events"""
+    async def handle_event(self, event) -> bool:
+        """Handle Wyoming protocol events."""
+        # Send info on Describe event
         if Describe.is_type(event.type):
-            # Send server info in response to describe request
             await self.write_event(self.wyoming_info_event)
             return True
         
         if Synthesize.is_type(event.type):
             synthesize = Synthesize.from_event(event)
-            _LOGGER.debug(f"Received synthesis request: {synthesize.text}")
-            
-            # Determine which voice to use
-            voice_name = synthesize.voice.name if synthesize.voice else self.default_voice
-            if not voice_name:
-                _LOGGER.error("No voice specified and no default voice available")
-                return False
-            
-            try:
-                # Send audio start event immediately for low latency perception
-                await self.write_event(
-                    AudioStart(
-                        rate=SAMPLE_RATE,
-                        width=2,  # 16-bit = 2 bytes
-                        channels=1
-                    ).event()
-                )
-                
-                # Synthesize audio in background thread
-                wav = await asyncio.to_thread(
-                    self.tts_engine.synthesize,
-                    synthesize.text,
-                    voice_name
-                )
-                
-                # Convert to 16-bit PCM
-                wav_int16 = (wav * 32767).astype(np.int16)
-                
-                # Stream audio in small chunks for responsive playback
-                chunk_size = 1024  # Small chunks for lower latency
-                for i in range(0, len(wav_int16), chunk_size):
-                    chunk = wav_int16[i:i + chunk_size]
-                    await self.write_event(
-                        AudioChunk(
-                            rate=SAMPLE_RATE,
-                            width=2,
-                            channels=1,
-                            audio=chunk.tobytes()
-                        ).event()
-                    )
-                
-                # Send audio stop event
-                await self.write_event(AudioStop().event())
-                _LOGGER.debug("Audio streaming complete")
-                
-            except Exception as e:
-                _LOGGER.error(f"Synthesis failed: {e}", exc_info=True)
-                return False
+            await self._synthesize(synthesize)
+            return True
         
         return True
+    
+    async def _synthesize(self, synthesize: Synthesize):
+        """Generate speech and stream audio back to client."""
+        text = synthesize.text
+        voice_name = synthesize.voice.name if synthesize.voice else None
+        
+        _LOGGER.info(f"[Client {self.client_id}] Synthesizing: '{text[:50]}...' with voice: {voice_name}")
+        
+        # Get the audio prompt path for voice cloning
+        audio_prompt_path = self.voices.get(voice_name) if voice_name else None
+        
+        if voice_name and not audio_prompt_path:
+            _LOGGER.warning(f"Voice '{voice_name}' not found, using default")
+        
+        # Since Chatterbox Turbo doesn't support true streaming, we chunk the input
+        # Split on sentence boundaries for more natural breaks
+        chunks = self._split_text(text)
+        
+        # Send audio start event
+        await self.write_event(
+            AudioStart(
+                rate=self.sample_rate,
+                width=2,  # 16-bit audio
+                channels=1
+            ).event()
+        )
+        
+        # Generate and stream each chunk
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            
+            _LOGGER.debug(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:30]}...'")
+            
+            # Generate audio for this chunk (runs in thread pool to avoid blocking)
+            audio = await asyncio.get_event_loop().run_in_executor(
+                None, 
+                self._generate_audio, 
+                chunk, 
+                audio_prompt_path
+            )
+            
+            # Convert to bytes and send
+            audio_bytes = (audio * 32767).numpy().astype("int16").tobytes()
+            
+            await self.write_event(
+                AudioChunk(
+                    rate=self.sample_rate,
+                    width=2,
+                    channels=1,
+                    audio=audio_bytes
+                ).event()
+            )
+        
+        # Send audio stop event
+        await self.write_event(AudioStop().event())
+        _LOGGER.info(f"[Client {self.client_id}] Synthesis complete")
+    
+    def _generate_audio(self, text: str, audio_prompt_path: str = None) -> torch.Tensor:
+        """Generate audio using Chatterbox Turbo (synchronous)."""
+        # Generate with or without voice cloning
+        if audio_prompt_path:
+            wav = self.model.generate(text, audio_prompt_path=audio_prompt_path)
+        else:
+            # Use default voice if no prompt provided
+            default_voice = next(iter(self.voices.values()), None)
+            if default_voice:
+                wav = self.model.generate(text, audio_prompt_path=default_voice)
+            else:
+                # Fallback: generate without voice cloning (if model supports it)
+                wav = self.model.generate(text)
+        
+        return wav.squeeze()  # Remove batch dimension
+    
+    @staticmethod
+    def _split_text(text: str, max_sentences: int = 3) -> list[str]:
+        """
+        Split text into chunks for pseudo-streaming.
+        Splits on sentence boundaries (punctuation), grouping a few sentences per chunk.
+        """
+        # Split by sentence-ending punctuation (.!?) keeping the punctuation
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Remove empty strings
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # If we have no sentences, return the original text
+        if not sentences:
+            return [text]
+        
+        # Group sentences into chunks of max_sentences
+        chunks = []
+        for i in range(0, len(sentences), max_sentences):
+            chunk = ' '.join(sentences[i:i + max_sentences])
+            chunks.append(chunk)
+        
+        return chunks
+
+
+def load_voices(voices_dir: Path) -> dict:
+    """Scan voices directory and return mapping of voice name -> file path."""
+    voices = {}
+    
+    if not voices_dir.exists():
+        _LOGGER.warning(f"Voices directory does not exist: {voices_dir}")
+        return voices
+    
+    # Find all .wav files in the voices directory
+    for wav_file in voices_dir.glob("*.wav"):
+        # Extract voice name from filename (e.g., "Jake.wav" -> "Jake")
+        voice_name = wav_file.stem
+        voices[voice_name] = str(wav_file)
+        _LOGGER.info(f"Loaded voice: {voice_name} from {wav_file.name}")
+    
+    if not voices:
+        _LOGGER.warning("No voice files found in voices directory")
+    
+    return voices
+
+
+@lru_cache(maxsize=1)
+def load_model(device: str = "cuda"):
+    """Load Chatterbox Turbo model (cached)."""
+    _LOGGER.info(f"Loading Chatterbox Turbo model on {device}...")
+    
+    # Patch watermarker if perth module is not available or broken
+    try:
+        import perth
+        if perth.PerthImplicitWatermarker is None:
+            raise ImportError("Perth watermarker not properly initialized")
+    except (ImportError, AttributeError) as e:
+        _LOGGER.warning(f"Perth watermarking not available ({e}), disabling watermarking")
+        # Create a dummy watermarker class that mimics the Perth API
+        class DummyWatermarker:
+            def apply_watermark(self, audio, *args, **kwargs):
+                """Pass-through watermark that returns audio unchanged."""
+                return audio
+            
+            def __call__(self, audio, *args, **kwargs):
+                return audio
+        
+        # Monkey-patch it into the module
+        import sys
+        if 'perth' not in sys.modules:
+            import types
+            sys.modules['perth'] = types.ModuleType('perth')
+        sys.modules['perth'].PerthImplicitWatermarker = lambda: DummyWatermarker()
+    
+    model = ChatterboxTurboTTS.from_pretrained(device=device)
+    _LOGGER.info("Model loaded successfully")
+    return model
 
 
 async def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Wyoming Chatterbox TTS Server")
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host to bind to (default: 0.0.0.0, env: HOST)"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "10200")),
-        help="Port to bind to (default: 10200, env: PORT)"
-    )
-    parser.add_argument(
-        "--voices-dir",
-        default=os.environ.get("VOICES_DIR", "./voices"),
-        help="Directory containing voice reference audio files (default: ./voices, env: VOICES_DIR)"
-    )
-    parser.add_argument(
-        "--dtype",
-        default=os.environ.get("DTYPE", "fp32"),
-        choices=["fp32", "fp16", "q8", "q4", "q4f16"],
-        help="Model data type (default: fp32, env: DTYPE)"
-    )
-    parser.add_argument(
-        "--cuda",
-        action="store_true",
-        default=os.environ.get("CUDA", "").lower() in ("1", "true", "yes"),
-        help="Use CUDA GPU acceleration (default: False, env: CUDA)"
-    )
-    parser.add_argument(
-        "--log-level",
-        default=os.environ.get("LOG_LEVEL", "INFO"),
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO, env: LOG_LEVEL)"
-    )
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="Wyoming Chatterbox Turbo TTS Server")
+    parser.add_argument("--uri", default="tcp://0.0.0.0:10200", help="Server URI")
+    parser.add_argument("--voices-dir", type=Path, default=Path("./voices"), 
+                       help="Directory containing voice reference .wav files")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
+                       help="Device to run model on")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
     
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    # Setup logging
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     
-    _LOGGER.info("=" * 60)
-    _LOGGER.info("Wyoming Chatterbox TTS Server")
-    _LOGGER.info("=" * 60)
+    # Load model
+    model = load_model(args.device)
     
-    # Check CUDA availability if requested
-    if args.cuda:
-        cuda_available = 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
-        if not cuda_available:
-            _LOGGER.warning("CUDA requested but not available. Install onnxruntime-gpu for CUDA support.")
-            _LOGGER.warning("Falling back to CPU execution.")
-        else:
-            _LOGGER.info("CUDA is available and will be used for acceleration")
+    # Create voices directory if it doesn't exist
+    args.voices_dir.mkdir(parents=True, exist_ok=True)
     
-    # Initialize TTS engine
-    tts_engine = ChatterboxTTS(
-        dtype=args.dtype,
-        voices_dir=args.voices_dir,
-        use_cuda=args.cuda
-    )
+    # Load voices
+    voices = load_voices(args.voices_dir)
     
-    try:
-        tts_engine.load_models()
-        tts_engine.load_voices()
-    except Exception as e:
-        _LOGGER.error(f"Failed to initialize TTS engine: {e}", exc_info=True)
-        return 1
+    # Create Wyoming info (using model's native sample rate)
+    wyoming_info = create_info(args.voices_dir, model.sr)
     
-    if not tts_engine.voices:
-        _LOGGER.error("No voices available. Cannot start server.")
-        return 1
+    # Create server from URI
+    _LOGGER.info(f"Starting Wyoming server on {args.uri}")
+    server = AsyncServer.from_uri(args.uri)
     
-    # Build Wyoming info
-    voices = [
-        TtsVoice(
-            name=name,
-            description=f"Chatterbox voice: {name}",
-            attribution=Attribution(
-                name="Resemble AI",
-                url="https://huggingface.co/ResembleAI/chatterbox-turbo-ONNX"
-            ),
-            installed=True,
-            version="1.0.0",
-            languages=["en"]  # Chatterbox supports English
+    # Run server with handler factory
+    await server.run(
+        partial(
+            ChatterboxTurboEventHandler,
+            wyoming_info,
+            model,
+            voices
         )
-        for name in tts_engine.voices.keys()
-    ]
+    )
+
+
+def create_info(voices_dir: Path, sample_rate: int) -> Info:
+    """Create Wyoming Info with available voices."""
+    voices = []
     
-    wyoming_info = Info(
+    # Discover voices from directory
+    if voices_dir.exists():
+        for wav_file in voices_dir.glob("*.wav"):
+            voice_name = wav_file.stem
+            voices.append(
+                TtsVoice(
+                    name=voice_name,
+                    description=f"Cloned voice from {wav_file.name}",
+                    attribution=Attribution(
+                        name="Chatterbox Turbo",
+                        url="https://github.com/resemble-ai/chatterbox"
+                    ),
+                    installed=True,
+                    version="1.0",  # Required by Wyoming protocol
+                    languages=["en"],  # Adjust based on your needs
+                )
+            )
+    
+    return Info(
         tts=[
             TtsProgram(
                 name="chatterbox-turbo",
-                description="Resemble AI Chatterbox Turbo TTS",
+                description="Chatterbox Turbo TTS with voice cloning",
                 attribution=Attribution(
                     name="Resemble AI",
-                    url="https://huggingface.co/ResembleAI/chatterbox-turbo-ONNX"
+                    url="https://github.com/resemble-ai/chatterbox"
                 ),
                 installed=True,
-                version="1.0.0",
-                voices=voices
+                version="1.0",  # Required by Wyoming protocol
+                voices=voices,
             )
         ]
     )
-    
-    # Start Wyoming server
-    _LOGGER.info(f"Starting server on {args.host}:{args.port}")
-    _LOGGER.info(f"Available voices: {', '.join(tts_engine.voices.keys())}")
-    
-    server = AsyncServer.from_uri(f"tcp://{args.host}:{args.port}")
-    
-    # Use partial to bind custom parameters, leaving reader/writer for Wyoming
-    await server.run(partial(
-        ChatterboxEventHandler,
-        tts_engine,
-        wyoming_info
-    ))
-    
-    return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        _LOGGER.info("Shutting down...")
-        sys.exit(0)
+    asyncio.run(main())
