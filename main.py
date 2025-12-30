@@ -105,28 +105,46 @@ class ChatterboxEventHandler(AsyncEventHandler):
         # Send audio stop event
         await self.write_event(AudioStop().event())
         _LOGGER.info(f"[Client {self.client_id}] Synthesis complete")
+
     
     def _generate_audio(self, text: str, audio_prompt_path: str = None) -> torch.Tensor:
         """Generate audio using Chatterbox (synchronous)."""
+        # Use optimized generation parameters for speed
+        # Get backend from model (set during initialization)
+        backend = getattr(self.model, '_wyoming_backend', 'cudagraphs-manual')
+        
+        t3_params = {
+            "generate_token_backend": backend,
+            "skip_when_1": True,  # Skip Top P when it's 1.0
+        }
+        
         # Generate with or without voice cloning
         if audio_prompt_path:
-            wav = self.model.generate(text, audio_prompt_path=audio_prompt_path)
+            wav = self.model.generate(text, audio_prompt_path=audio_prompt_path, t3_params=t3_params)
         else:
             # Use default voice if no prompt provided
             default_voice = next(iter(self.voices.values()), None)
             if default_voice:
-                wav = self.model.generate(text, audio_prompt_path=default_voice)
+                wav = self.model.generate(text, audio_prompt_path=default_voice, t3_params=t3_params)
             else:
                 # Fallback: generate without voice cloning
-                wav = self.model.generate(text)
+                wav = self.model.generate(text, t3_params=t3_params)
         
-        return wav.squeeze()  # Remove batch dimension
+        # Move to CPU immediately to free VRAM - numpy conversion happens on CPU anyway
+        result = wav.squeeze().cpu()
+        
+        # Clear CUDA cache to prevent VRAM creep
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return result
     
     @staticmethod
-    def _split_text(text: str, max_sentences: int = 3) -> list[str]:
+    def _split_text(text: str, max_sentences: int = 3, max_chunk_length: int = 500) -> list[str]:
         """
         Split text into chunks for pseudo-streaming.
         Splits on sentence boundaries (punctuation), grouping a few sentences per chunk.
+        Also ensures chunks don't exceed max_chunk_length to prevent memory issues.
         """
         # Split by sentence-ending punctuation (.!?) keeping the punctuation
         sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -134,15 +152,48 @@ class ChatterboxEventHandler(AsyncEventHandler):
         # Remove empty strings
         sentences = [s.strip() for s in sentences if s.strip()]
         
-        # If we have no sentences, return the original text
+        # If we have no sentences, split by max_chunk_length if text is too long
         if not sentences:
+            if len(text) > max_chunk_length:
+                # Split long text by word boundaries
+                words = text.split()
+                chunks = []
+                current = ""
+                for word in words:
+                    if len(current) + len(word) + 1 > max_chunk_length:
+                        if current:
+                            chunks.append(current.strip())
+                        current = word
+                    else:
+                        current += (" " if current else "") + word
+                if current:
+                    chunks.append(current.strip())
+                return chunks
             return [text]
         
-        # Group sentences into chunks of max_sentences
+        # Group sentences into chunks, respecting both max_sentences and max_chunk_length
         chunks = []
-        for i in range(0, len(sentences), max_sentences):
-            chunk = ' '.join(sentences[i:i + max_sentences])
-            chunks.append(chunk)
+        current_chunk = ""
+        sentence_count = 0
+        
+        for sentence in sentences:
+            # Check if adding this sentence would exceed limits
+            would_exceed_length = len(current_chunk) + len(sentence) + 1 > max_chunk_length
+            would_exceed_count = sentence_count >= max_sentences
+            
+            if current_chunk and (would_exceed_length or would_exceed_count):
+                # Flush current chunk and start new one
+                chunks.append(current_chunk.strip())
+                current_chunk = sentence
+                sentence_count = 1
+            else:
+                # Add sentence to current chunk
+                current_chunk += (" " if current_chunk else "") + sentence
+                sentence_count += 1
+        
+        # Add remaining chunk
+        if current_chunk:
+            chunks.append(current_chunk.strip())
         
         return chunks
 
@@ -219,9 +270,18 @@ def load_model(device: str = "cuda", dtype: str = "float32"):
     
     # Warmup for cudagraphs (recommended by Chatterbox docs)
     if device == "cuda":
-        _LOGGER.info("Warming up model with cudagraphs...")
-        model.generate("Warmup for cudagraphs optimization.")
-        _LOGGER.info("Warmup complete")
+        _LOGGER.info("Warming up model with cudagraphs optimization...")
+        # First warmup call sets up the cudagraph
+        model.generate(
+            "Warmup for cudagraphs optimization.", 
+            t3_params={"generate_token_backend": "cudagraphs-manual"}
+        )
+        # Second call runs at full speed
+        model.generate(
+            "Second warmup for full cudagraphs speed.",
+            t3_params={"generate_token_backend": "cudagraphs-manual"}
+        )
+        _LOGGER.info("Warmup complete - cudagraphs ready")
     
     _LOGGER.info("Model loaded successfully")
     return model
@@ -238,6 +298,9 @@ async def main():
     parser.add_argument("--dtype", default="float32",
                        choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
                        help="Model precision (bf16 recommended for RTX 30xx/40xx)")
+    parser.add_argument("--backend", default="cudagraphs-manual",
+                       choices=["cudagraphs-manual", "cudagraphs", "eager", "inductor"],
+                       help="Generation backend (cudagraphs-manual is fastest)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
@@ -247,6 +310,9 @@ async def main():
     
     # Load model
     model = load_model(args.device, args.dtype)
+    
+    # Store backend preference on model for use in generation
+    model._wyoming_backend = args.backend
     
     # Create voices directory if it doesn't exist
     args.voices_dir.mkdir(parents=True, exist_ok=True)
