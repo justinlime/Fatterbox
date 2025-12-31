@@ -10,5 +10,8 @@ dependencies = [
     "torch",
     "torchaudio",
     "perth",
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.5.4/flash_attn-2.8.3+cu124torch2.6-cp311-cp311-linux_x86_64.whl"
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.5.4/flash_attn-2.8.3+cu124torch2.6-cp311-cp311-linux_x86_64.whl",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
 ]

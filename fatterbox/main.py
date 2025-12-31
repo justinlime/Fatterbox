@@ -10,8 +10,10 @@ import os
 from functools import partial
 from pathlib import Path
 
+import uvicorn
 from wyoming.server import AsyncServer
 
+from .openapi import create_api
 from .handler import ChatterboxEventHandler
 from .model import load_model
 from .voices import load_voices, create_wyoming_info
@@ -35,10 +37,64 @@ def get_env_int(key: str, default: int) -> int:
         return default
 
 
+async def run_wyoming_server(args, model, voices, wyoming_info):
+    """Run Wyoming protocol server."""
+    _LOGGER.info(f"Starting Wyoming server on tcp://{args.wyoming_host}:{args.wyoming_port}")
+    uri = f"tcp://{args.wyoming_host}:{args.wyoming_port}"
+    server = AsyncServer.from_uri(uri)
+    
+    await server.run(
+        partial(
+            ChatterboxEventHandler,
+            wyoming_info,
+            model,
+            voices
+        )
+    )
+
+
+async def run_fastapi_server(args, model, voices):
+    """Run FastAPI REST API server."""
+    app = create_api(model, voices, args.voices_dir)
+    
+    host = args.openapi_host
+    port = args.openapi_port
+    
+    _LOGGER.info(f"Starting OpenAPI server on {host}:{port}")
+    _LOGGER.info(f"OpenAPI endpoints:")
+    _LOGGER.info(f"  - POST http://{host}:{port}/v1/audio/speech (streaming)")
+    _LOGGER.info(f"  - GET  http://{host}:{port}/v1/voices")
+    _LOGGER.info(f"  - GET  http://{host}:{port}/v1/info")
+    _LOGGER.info(f"API documentation: http://{host}:{port}/docs")
+    
+    # Run uvicorn server
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info" if not args.debug else "debug"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 async def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Wyoming Chatterbox TTS Server")
-    parser.add_argument("--uri", default="tcp://0.0.0.0:10200", help="Server URI")
+    """Main entry point - runs both Wyoming and OpenAPI servers by default."""
+    parser = argparse.ArgumentParser(description="Fatterbox: Wyoming + OpenAPI Chatterbox TTS Server")
+    
+    # Wyoming server options
+    parser.add_argument("--wyoming-host", default="0.0.0.0",
+                       help="Wyoming server host (default: 0.0.0.0)")
+    parser.add_argument("--wyoming-port", type=int, default=10200,
+                       help="Wyoming server port (default: 10200)")
+    
+    # OpenAPI server options
+    parser.add_argument("--openapi-host", default="0.0.0.0",
+                       help="OpenAPI server host (default: 0.0.0.0)")
+    parser.add_argument("--openapi-port", type=int, default=8000,
+                       help="OpenAPI server port (default: 8000)")
+    
+    # Common options
     parser.add_argument("--voices-dir", type=Path, default=Path("./voices"), 
                        help="Directory containing voice reference .wav files")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
@@ -86,6 +142,10 @@ async def main():
     # Setup logging
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     
+    _LOGGER.info("="*60)
+    _LOGGER.info("Fatterbox TTS Server - Wyoming + OpenAPI")
+    _LOGGER.info("="*60)
+    
     # Log generation parameters
     _LOGGER.info(f"Generation parameters:")
     _LOGGER.info(f"  exaggeration: {args.exaggeration}")
@@ -121,18 +181,11 @@ async def main():
     # Create Wyoming info (using model's native sample rate)
     wyoming_info = create_wyoming_info(args.voices_dir, model.sr)
     
-    # Create server from URI
-    _LOGGER.info(f"Starting Wyoming server on {args.uri}")
-    server = AsyncServer.from_uri(args.uri)
-    
-    # Run server with handler factory
-    await server.run(
-        partial(
-            ChatterboxEventHandler,
-            wyoming_info,
-            model,
-            voices
-        )
+    # Run both servers concurrently
+    _LOGGER.info("="*60)
+    await asyncio.gather(
+        run_wyoming_server(args, model, voices, wyoming_info),
+        run_fastapi_server(args, model, voices)
     )
 
 
