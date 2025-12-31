@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from functools import lru_cache, partial
 
@@ -14,7 +15,7 @@ import torch
 import torchaudio as ta
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
-from wyoming.tts import Synthesize, SynthesizeStart, SynthesizeStop, SynthesizeChunk
+from wyoming.tts import Synthesize, SynthesizeStart, SynthesizeStop, SynthesizeChunk, SynthesizeStopped
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import async_write_event
 from wyoming.info import Describe
@@ -22,6 +23,14 @@ from wyoming.info import Describe
 from chatterbox.tts import ChatterboxTTS
 
 _LOGGER = logging.getLogger(__name__)
+
+# ANSI color codes for logging
+class Colors:
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
 
 
 class ChatterboxEventHandler(AsyncEventHandler):
@@ -54,7 +63,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
             self.is_streaming = True  # Set streaming flag
             self._streaming_text = ""  # Initialize empty, text comes in chunks
             self._streaming_voice = synth_start.voice
-            _LOGGER.debug(f"[Client {self.client_id}] SynthesizeStart received with voice: {synth_start.voice}")
+            _LOGGER.info(f"{Colors.CYAN}[Client {self.client_id}] Mode: STREAMING{Colors.RESET}")
             return True
 
         if SynthesizeChunk.is_type(event.type):
@@ -68,6 +77,10 @@ class ChatterboxEventHandler(AsyncEventHandler):
             if self.is_streaming:
                 _LOGGER.info(f"[Client {self.client_id}] SynthesizeStop received, synthesizing accumulated text: '{self._streaming_text[:50]}...'")
                 await self._synthesize_text(self._streaming_text, self._streaming_voice)
+
+                # Send SynthesizeStopped event to signal synthesis is complete
+                await self.write_event(SynthesizeStopped().event())
+
                 # Reset streaming state
                 self.is_streaming = False
                 self._streaming_text = None
@@ -82,7 +95,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
                 return True
 
             synthesize = Synthesize.from_event(event)
-            _LOGGER.info(f"[Client {self.client_id}] Non-streaming Synthesize received")
+            _LOGGER.info(f"{Colors.MAGENTA}[Client {self.client_id}] Mode: STANDARD{Colors.RESET}")
             await self._synthesize_text(synthesize.text, synthesize.voice)
             return True
 
@@ -102,6 +115,10 @@ class ChatterboxEventHandler(AsyncEventHandler):
 
         # Split on sentence boundaries for streaming
         chunks = self._split_text(text)
+
+        # Track timing
+        synthesis_start = time.time()
+        first_chunk_sent = False
 
         try:
             # Send audio start event
@@ -125,7 +142,8 @@ class ChatterboxEventHandler(AsyncEventHandler):
                         torch.cuda.empty_cache()
                     return
 
-                _LOGGER.debug(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:30]}...'")
+                # Time this chunk's synthesis
+                chunk_start = time.time()
 
                 # Generate audio for this chunk (runs in thread pool to avoid blocking)
                 audio = await asyncio.get_event_loop().run_in_executor(
@@ -134,6 +152,8 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     chunk, 
                     audio_prompt_path
                 )
+
+                chunk_synth_time = time.time() - chunk_start
 
                 # Check again after generation in case client disconnected during generation
                 if self.writer.is_closing():
@@ -155,12 +175,21 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     ).event()
                 )
 
-                _LOGGER.debug(f"Chunk {i+1}/{len(chunks)} sent")
+                # Log first chunk sent
+                if not first_chunk_sent:
+                    ttfa = time.time() - synthesis_start
+                    _LOGGER.info(f"{Colors.GREEN}[Client {self.client_id}] First chunk sent (TTFA: {ttfa:.2f}s){Colors.RESET}")
+                    first_chunk_sent = True
+
+                # Log chunk timing
+                _LOGGER.info(f"{Colors.YELLOW}[Client {self.client_id}] Chunk {i+1}/{len(chunks)}: {chunk_synth_time:.2f}s{Colors.RESET}")
             
             # Send audio stop event WITHOUT TIMESTAMP
             await self.write_event(AudioStop().event())
 
-            _LOGGER.info(f"[Client {self.client_id}] Synthesis complete")
+            # Log completion with total time
+            total_time = time.time() - synthesis_start
+            _LOGGER.info(f"{Colors.GREEN}[Client {self.client_id}] Complete - Total time: {total_time:.2f}s{Colors.RESET}")
         
         except ConnectionResetError:
             _LOGGER.info(f"[Client {self.client_id}] Client disconnected during synthesis (normal - user likely interrupted)")
