@@ -214,37 +214,39 @@ class ChatterboxEventHandler(AsyncEventHandler):
     
     def _generate_audio(self, text: str, audio_prompt_path: str = None) -> torch.Tensor:
         """Generate audio using Chatterbox (synchronous)."""
-        # Use optimized generation parameters for speed
-        # Get backend from model (set during initialization)
-        backend = getattr(self.model, '_wyoming_backend', 'cudagraphs-manual')
-        
-        t3_params = {
-            "benchmark_t3": True,
-            "generate_token_backend": backend,
-            "skip_when_1": True,  # Skip Top P when it's 1.0
-        }
-        
-        # Generate with or without voice cloning
-        if audio_prompt_path:
-            wav = self.model.generate(text, audio_prompt_path=audio_prompt_path, t3_params=t3_params)
-        else:
-            # Use default voice if no prompt provided
-            default_voice = next(iter(self.voices.values()), None)
-            if default_voice:
-                wav = self.model.generate(text, audio_prompt_path=default_voice, t3_params=t3_params)
+        # Use no_grad to prevent memory accumulation from autograd
+        with torch.no_grad():
+            # Get backend from model (set during initialization)
+            backend = getattr(self.model, '_wyoming_backend', 'cudagraphs-manual')
+
+            t3_params = {
+                "benchmark_t3": True,
+                "generate_token_backend": backend,
+                "skip_when_1": True,  # Skip Top P when it's 1.0
+            }
+
+            # Generate with or without voice cloning
+            if audio_prompt_path:
+                wav = self.model.generate(text, audio_prompt_path=audio_prompt_path, t3_params=t3_params)
             else:
-                # Fallback: generate without voice cloning
-                wav = self.model.generate(text, t3_params=t3_params)
-        
-        # Move to CPU immediately to free VRAM - numpy conversion happens on CPU anyway
-        result = wav.squeeze().cpu()
-        
-        # Clear CUDA cache to prevent VRAM creep
+                # Use default voice if no prompt provided
+                default_voice = next(iter(self.voices.values()), None)
+                if default_voice:
+                    wav = self.model.generate(text, audio_prompt_path=default_voice, t3_params=t3_params)
+                else:
+                    # Fallback: generate without voice cloning
+                    wav = self.model.generate(text, t3_params=t3_params)
+
+            # Move to CPU immediately to free VRAM - numpy conversion happens on CPU anyway
+            result = wav.squeeze().cpu()
+
+        # Synchronize to ensure all CUDA operations are complete before cleanup
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        
-        return result
-    
+
+        return result 
+
     @staticmethod
     def _split_text(text: str, max_sentences: int = 1, max_chunk_length: int = 300) -> list[str]:
         """
@@ -482,7 +484,6 @@ def create_info(voices_dir: Path, sample_rate: int) -> Info:
             )
         ]
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())
