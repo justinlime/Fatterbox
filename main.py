@@ -14,7 +14,7 @@ import torch
 import torchaudio as ta
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
-from wyoming.tts import Synthesize
+from wyoming.tts import Synthesize, SynthesizeStart, SynthesizeStop, SynthesizeChunk
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import async_write_event
 from wyoming.info import Describe
@@ -35,6 +35,10 @@ class ChatterboxEventHandler(AsyncEventHandler):
         self.voices = voices
         self.sample_rate = model.sr  # Use model's native sample rate
         self.client_id = id(self)
+        
+        # Streaming state
+        self._streaming_text = None
+        self._streaming_voice = None
     
     async def handle_event(self, event) -> bool:
         """Handle Wyoming protocol events."""
@@ -42,70 +46,132 @@ class ChatterboxEventHandler(AsyncEventHandler):
         if Describe.is_type(event.type):
             await self.write_event(self.wyoming_info_event)
             return True
-        
+
+        # Handle streaming TTS (new protocol)
+        if SynthesizeStart.is_type(event.type):
+            synth_start = SynthesizeStart.from_event(event)
+            self._streaming_text = ""  # Initialize empty, text comes in chunks
+            self._streaming_voice = synth_start.voice
+            _LOGGER.debug(f"[Client {self.client_id}] SynthesizeStart received with voice: {synth_start.voice}")
+            return True
+
+        if SynthesizeChunk.is_type(event.type):
+            if self._streaming_text is not None:
+                synth_chunk = SynthesizeChunk.from_event(event)
+                self._streaming_text += synth_chunk.text
+                _LOGGER.debug(f"[Client {self.client_id}] SynthesizeChunk received: '{synth_chunk.text}'")
+            return True
+
+        if SynthesizeStop.is_type(event.type):
+            if self._streaming_text is not None:
+                _LOGGER.info(f"[Client {self.client_id}] SynthesizeStop received, synthesizing accumulated text: '{self._streaming_text[:50]}...'")
+                await self._synthesize_text(self._streaming_text, self._streaming_voice)
+                self._streaming_text = None
+                self._streaming_voice = None
+            return True
+
+        # Handle non-streaming TTS (old protocol - for backwards compatibility)
         if Synthesize.is_type(event.type):
             synthesize = Synthesize.from_event(event)
-            await self._synthesize(synthesize)
+            _LOGGER.info(f"[Client {self.client_id}] Non-streaming Synthesize received")
+            await self._synthesize_text(synthesize.text, synthesize.voice)
             return True
-        
-        return True
-    
-    async def _synthesize(self, synthesize: Synthesize):
-        """Generate speech and stream audio back to client."""
-        text = synthesize.text
-        voice_name = synthesize.voice.name if synthesize.voice else None
-        
+
+        return True    
+    async def _synthesize_text(self, text: str, voice_spec):
+        """Generate and stream speech."""
+        voice_name = voice_spec.name if voice_spec else None
+
         _LOGGER.info(f"[Client {self.client_id}] Synthesizing: '{text[:50]}...' with voice: {voice_name}")
-        
+
         # Get the audio prompt path for voice cloning
         audio_prompt_path = self.voices.get(voice_name) if voice_name else None
-        
+
         if voice_name and not audio_prompt_path:
             _LOGGER.warning(f"Voice '{voice_name}' not found, using default")
-        
-        # Split on sentence boundaries for more natural streaming
+
+        # Split on sentence boundaries for streaming
         chunks = self._split_text(text)
-        
-        # Send audio start event
-        await self.write_event(
-            AudioStart(
-                rate=self.sample_rate,
-                width=2,  # 16-bit audio
-                channels=1
-            ).event()
-        )
-        
-        # Generate and stream each chunk
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():
-                continue
-            
-            _LOGGER.debug(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:30]}...'")
-            
-            # Generate audio for this chunk (runs in thread pool to avoid blocking)
-            audio = await asyncio.get_event_loop().run_in_executor(
-                None, 
-                self._generate_audio, 
-                chunk, 
-                audio_prompt_path
-            )
-            
-            # Convert to bytes and send
-            audio_bytes = (audio * 32767).numpy().astype("int16").tobytes()
-            
+
+        try:
+            # Send audio start event
             await self.write_event(
-                AudioChunk(
+                AudioStart(
                     rate=self.sample_rate,
-                    width=2,
-                    channels=1,
-                    audio=audio_bytes
+                    width=2,  # 16-bit audio
+                    channels=1
                 ).event()
             )
-        
-        # Send audio stop event
-        await self.write_event(AudioStop().event())
-        _LOGGER.info(f"[Client {self.client_id}] Synthesis complete")
 
+            # Generate and stream each chunk
+            for i, chunk in enumerate(chunks):
+                if not chunk.strip():
+                    continue
+
+                # Check if connection is still alive before expensive generation
+                if self.writer.is_closing():
+                    _LOGGER.info(f"[Client {self.client_id}] Connection closed, aborting synthesis at chunk {i+1}/{len(chunks)}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return
+
+                _LOGGER.debug(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:30]}...'")
+
+                # Generate audio for this chunk (runs in thread pool to avoid blocking)
+                audio = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    self._generate_audio, 
+                    chunk, 
+                    audio_prompt_path
+                )
+
+                # Check again after generation in case client disconnected during generation
+                if self.writer.is_closing():
+                    _LOGGER.info(f"[Client {self.client_id}] Connection closed during generation of chunk {i+1}/{len(chunks)}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return
+
+                # Convert to bytes and send
+                audio_bytes = (audio * 32767).numpy().astype("int16").tobytes()
+
+                # Send audio chunk WITHOUT TIMESTAMP for immediate streaming
+                await self.write_event(
+                    AudioChunk(
+                        rate=self.sample_rate,
+                        width=2,
+                        channels=1,
+                        audio=audio_bytes
+                    ).event()
+                )
+
+                _LOGGER.debug(f"Chunk {i+1}/{len(chunks)} sent")
+            
+            # Send audio stop event WITHOUT TIMESTAMP
+            await self.write_event(AudioStop().event())
+
+            _LOGGER.info(f"[Client {self.client_id}] Synthesis complete")
+        
+        except ConnectionResetError:
+            _LOGGER.info(f"[Client {self.client_id}] Client disconnected during synthesis (normal - user likely interrupted)")
+            # Clean up CUDA cache since we generated partial audio
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except BrokenPipeError:
+            _LOGGER.info(f"[Client {self.client_id}] Connection broken during synthesis (normal - client closed connection)")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            _LOGGER.error(f"[Client {self.client_id}] Unexpected error during synthesis: {e}", exc_info=True)
+            # Try to send audio stop if connection is still alive
+            try:
+                if not self.writer.is_closing():
+                    await self.write_event(AudioStop().event())
+            except Exception:
+                pass  # Connection already dead, ignore
+            # Clean up CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     def _generate_audio(self, text: str, audio_prompt_path: str = None) -> torch.Tensor:
         """Generate audio using Chatterbox (synchronous)."""
@@ -140,11 +206,11 @@ class ChatterboxEventHandler(AsyncEventHandler):
         return result
     
     @staticmethod
-    def _split_text(text: str, max_sentences: int = 3, max_chunk_length: int = 500) -> list[str]:
+    def _split_text(text: str, max_sentences: int = 1, max_chunk_length: int = 300) -> list[str]:
         """
-        Split text into chunks for pseudo-streaming.
-        Splits on sentence boundaries (punctuation), grouping a few sentences per chunk.
-        Also ensures chunks don't exceed max_chunk_length to prevent memory issues.
+        Split text into chunks for pseudo-streaming optimized for low latency.
+        Uses single-sentence chunks by default for fastest time-to-first-audio.
+        Also ensures chunks don't exceed max_chunk_length to prevent VRAM spikes.
         """
         # Split by sentence-ending punctuation (.!?) keeping the punctuation
         sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -372,6 +438,7 @@ def create_info(voices_dir: Path, sample_rate: int) -> Info:
                 installed=True,
                 version="1.0",
                 voices=voices,
+                supports_synthesize_streaming=True,  # Enable streaming support!
             )
         ]
     )
