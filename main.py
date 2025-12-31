@@ -219,6 +219,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
         backend = getattr(self.model, '_wyoming_backend', 'cudagraphs-manual')
         
         t3_params = {
+            "benchmark_t3": True,
             "generate_token_backend": backend,
             "skip_when_1": True,  # Skip Top P when it's 1.0
         }
