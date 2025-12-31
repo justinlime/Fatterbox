@@ -202,28 +202,21 @@ class ChatterboxEventHandler(AsyncEventHandler):
             backend = getattr(self.model, '_wyoming_backend', 'cudagraphs-manual')
             gen_params = getattr(self.model, '_wyoming_gen_params', {})
 
+            # Only include backend/performance parameters in t3_params
+            # Sampling parameters (temperature, top_p, etc.) may cause conflicts
             t3_params = {
                 "benchmark_t3": True,
                 "generate_token_backend": backend,
                 "skip_when_1": True,  # Skip Top P when it's 1.0
-                # Add generation parameters
-                "temperature": gen_params.get("temperature", 0.8),
-                "top_p": gen_params.get("top_p", 1.0),
-                "min_p": gen_params.get("min_p", 0.0),
-                "max_new_tokens": gen_params.get("max_new_tokens", 4096),
             }
 
             # Add seed if specified (non-zero)
             if gen_params.get("seed"):
                 t3_params["seed"] = gen_params["seed"]
 
-            # Flow matching parameters
-            s3gen_params = {
-                "n_timesteps": gen_params.get("n_timesteps", 10),
-                "cfg_scale": gen_params.get("flow_cfg_scale", 1.0),
-            }
-
             # Generate with or without voice cloning
+            # Note: Removed temperature, top_p, min_p, max_new_tokens from t3_params
+            # as they may be causing conflicts or aren't supported in the public API
             if audio_prompt_path:
                 wav = self.model.generate(
                     text, 
@@ -231,7 +224,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     exaggeration=gen_params.get("exaggeration", 0.5),
                     cfg_weight=gen_params.get("cfg_weight", 0.5),
                     t3_params=t3_params,
-                    s3gen_params=s3gen_params,
                 )
             else:
                 # Use default voice if no prompt provided
@@ -243,7 +235,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
                         exaggeration=gen_params.get("exaggeration", 0.5),
                         cfg_weight=gen_params.get("cfg_weight", 0.5),
                         t3_params=t3_params,
-                        s3gen_params=s3gen_params,
                     )
                 else:
                     # Fallback: generate without voice cloning
@@ -252,7 +243,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
                         exaggeration=gen_params.get("exaggeration", 0.5),
                         cfg_weight=gen_params.get("cfg_weight", 0.5),
                         t3_params=t3_params,
-                        s3gen_params=s3gen_params,
                     )
 
             # Move to CPU immediately to free VRAM - numpy conversion happens on CPU anyway
