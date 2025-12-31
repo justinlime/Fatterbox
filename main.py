@@ -37,6 +37,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
         self.client_id = id(self)
         
         # Streaming state
+        self.is_streaming = False  # Boolean flag to track streaming mode
         self._streaming_text = None
         self._streaming_voice = None
     
@@ -50,34 +51,43 @@ class ChatterboxEventHandler(AsyncEventHandler):
         # Handle streaming TTS (new protocol)
         if SynthesizeStart.is_type(event.type):
             synth_start = SynthesizeStart.from_event(event)
+            self.is_streaming = True  # Set streaming flag
             self._streaming_text = ""  # Initialize empty, text comes in chunks
             self._streaming_voice = synth_start.voice
             _LOGGER.debug(f"[Client {self.client_id}] SynthesizeStart received with voice: {synth_start.voice}")
             return True
 
         if SynthesizeChunk.is_type(event.type):
-            if self._streaming_text is not None:
+            if self.is_streaming:
                 synth_chunk = SynthesizeChunk.from_event(event)
                 self._streaming_text += synth_chunk.text
                 _LOGGER.debug(f"[Client {self.client_id}] SynthesizeChunk received: '{synth_chunk.text}'")
             return True
 
         if SynthesizeStop.is_type(event.type):
-            if self._streaming_text is not None:
+            if self.is_streaming:
                 _LOGGER.info(f"[Client {self.client_id}] SynthesizeStop received, synthesizing accumulated text: '{self._streaming_text[:50]}...'")
                 await self._synthesize_text(self._streaming_text, self._streaming_voice)
+                # Reset streaming state
+                self.is_streaming = False
                 self._streaming_text = None
                 self._streaming_voice = None
             return True
 
         # Handle non-streaming TTS (old protocol - for backwards compatibility)
         if Synthesize.is_type(event.type):
+            if self.is_streaming:
+                # Ignore since this is only sent for compatibility reasons
+                _LOGGER.debug(f"[Client {self.client_id}] Ignoring Synthesize event (streaming mode active)")
+                return True
+
             synthesize = Synthesize.from_event(event)
             _LOGGER.info(f"[Client {self.client_id}] Non-streaming Synthesize received")
             await self._synthesize_text(synthesize.text, synthesize.voice)
             return True
 
-        return True    
+        return True
+
     async def _synthesize_text(self, text: str, voice_spec):
         """Generate and stream speech."""
         voice_name = voice_spec.name if voice_spec else None
