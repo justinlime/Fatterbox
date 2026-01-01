@@ -1,4 +1,5 @@
 """Utility functions and constants."""
+import os
 import re
 
 
@@ -9,6 +10,35 @@ class Colors:
     GREEN = '\033[92m'
     YELLOW = '\033[93m'
     RESET = '\033[0m'
+
+
+def get_env_str(key: str, default: str) -> str:
+    """Get string from environment variable with fallback to default."""
+    return os.getenv(key, default)
+
+
+def get_env_float(key: str, default: float) -> float:
+    """Get float from environment variable with fallback to default."""
+    try:
+        return float(os.getenv(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def get_env_int(key: str, default: int) -> int:
+    """Get int from environment variable with fallback to default."""
+    try:
+        return int(os.getenv(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def get_env_bool(key: str, default: bool) -> bool:
+    """Get bool from environment variable with fallback to default."""
+    value = os.getenv(key)
+    if value is None:
+        return default
+    return value.lower() in ('true', '1', 'yes', 'on')
 
 
 def split_text(text: str, max_sentences: int = 1, max_chunk_length: int = 300) -> list[str]:
