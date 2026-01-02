@@ -1,7 +1,3 @@
-# Fatterbox Usage Guide
-
-Fatterbox is a Wyoming protocol and OpenAPI-compatible wrapper for Chatterbox TTS with voice cloning support.
-
 ## Overview
 
 Fatterbox is built on [rsxdalv's optimized Chatterbox implementation](https://github.com/rsxdalv/chatterbox/tree/faster), exposing both Wyoming protocol and OpenAPI endpoints with streaming support for minimal time-to-first-word latency. The streaming architecture splits text into sentence chunks and generates audio progressively, allowing playback to begin before the entire text is synthesized.
@@ -57,10 +53,12 @@ FATTERBOX_DTYPE=bf16               # float32, fp16, bf16 (bf16 recommended)
 FATTERBOX_BACKEND=cudagraphs-manual # fastest option
 ```
 
-**VRAM Usage:**
+**Minimum VRAM Required:**
 - FP32: ~4.5 GB
 - FP16/BF16: ~3.5 GB (recommended)
 
+Estimates based on my tests with a RTX 3090. You might experience memory spikes if generating
+large sentences without punctuations.
 BF16 offers the best balance of speed and memory efficiency on modern GPUs.
 
 ### Generation Parameters
@@ -119,4 +117,3 @@ Compatible with Home Assistant's Wyoming protocol. Configure in Home Assistant u
 - RTX 30xx/40xx GPUs have native BF16 support for optimal performance
 - Use `cudagraphs-manual` backend (default) for fastest generation
 - Lower `EXAGGERATION` and `CFG_WEIGHT` for more expressive speech
-- Single-sentence streaming provides lowest latency
